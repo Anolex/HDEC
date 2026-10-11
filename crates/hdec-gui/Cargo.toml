@@ -1,0 +1,13 @@
+[package]
+name = "hdec-gui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "hdec"
+path = "src/main.rs"
+
+[dependencies]
+hdec-core.workspace = true
+eframe.workspace = true
+egui_extras.workspace = true

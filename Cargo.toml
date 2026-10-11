@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+hdec-core = { path = "crates/hdec-core" }
+eframe = "0.36.2"
+egui_extras = "0.36.2"
