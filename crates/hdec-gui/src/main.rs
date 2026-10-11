@@ -1,3 +1,6 @@
+// No console window behind the GUI on Windows release builds.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use hdec_core::{CreateOptions, Ctx, Edit, Entry, Error, ExtractOptions, Format, Level, Overwrite};

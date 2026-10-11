@@ -355,10 +355,12 @@ fn reads_system_tar_archives() {
         "bsdtar.tar.bz2",
     ] {
         let tmp = tempfile::tempdir().unwrap();
+        // Windows skips symlinks (with a warning); nothing else may warn.
         assert!(
             extract(&fixture(name), tmp.path(), None)
                 .unwrap()
-                .is_empty(),
+                .iter()
+                .all(|w| !cfg!(unix) && w.contains("symlink")),
             "{name}"
         );
         assert_eq!(
@@ -797,7 +799,12 @@ fn reads_rar5_with_symlinks() {
     let dest = tmp.path().join("d");
     let warnings = extract(&fixture("rar5.rar"), &dest, None).unwrap();
     check_rar_tree(&dest, "rar5");
-    assert_eq!(warnings.len(), 1, "{warnings:?}"); // tree/evil escapes
+    // tree/evil escapes; on Windows tree/link is skipped too.
+    assert_eq!(
+        warnings.len(),
+        if cfg!(unix) { 1 } else { 2 },
+        "{warnings:?}"
+    );
     assert!(!tmp.path().join("outside").exists());
     #[cfg(unix)]
     assert_eq!(

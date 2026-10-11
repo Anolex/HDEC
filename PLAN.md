@@ -112,7 +112,7 @@ Each phase ends with: `cargo fmt --check`, `cargo clippy --all-targets -- -D war
 | P5 ✅ | Volumes + modify | split write, `.001` / spanned-ZIP read, add/delete/rename | split → join → identical; modify keeps untouched ZIP entries byte-identical |
 | P6+P7 ✅ | RAR | list / extract / test for RAR 1.3–7 via `rars`: encryption, encrypted headers, solid, multi-volume, symlinks | fixtures decode; **still to do: fixtures from real WinRAR** |
 | P8 ✅ | Extras | SFX `.exe` (7Z with header-CRC check, RAR via `rars`, ZIP via EOCD) and LZ / TAR.LZ. Deferred until asked: legacy filename code pages, Z, BR, CAB, DEB | per-item tests |
-| P9 | Release | file associations, context menu (Windows registry verbs, macOS Services), icons, `cargo-packager` (.dmg / .msi), signing + notarization, CI on macos + windows | signed installers install and open archives by double-click |
+| P9 🟡 | Release | done: CI (macOS + Windows: fmt, clippy, tests, no-C check), release profile, no console window on Windows. Todo: icon, macOS .app + handling Finder "open document" Apple Events (winit doesn't forward them), Windows installer with file associations + Explorer verbs, signing + notarization | signed installers install and open archives by double-click |
 
 ### RAR notes
 - Found `rars` (crates.io, Apache-2.0, pure Rust) after planning: reads RAR 1.3 through 7. We use it with `default-features = false, features = ["encryption"]`, so no RAR encoder is compiled in.

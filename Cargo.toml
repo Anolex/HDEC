@@ -30,3 +30,8 @@ zeroize = "1.9.1"
 # Compression crates are unusably slow unoptimized; keep our own code debuggable.
 [profile.dev.package."*"]
 opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
