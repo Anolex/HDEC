@@ -1,9 +1,12 @@
 mod formats {
+    pub mod stream;
+    pub mod tar;
     pub mod zip;
 }
 mod fs;
 pub mod safe_path;
 
+use std::cell::Cell;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -89,6 +92,10 @@ impl Format {
         }
     }
 
+    pub fn encryptable(self) -> bool {
+        matches!(self, Format::Zip | Format::SevenZ)
+    }
+
     /// File extension without the leading dot.
     pub fn extension(self) -> &'static str {
         match self {
@@ -136,6 +143,15 @@ impl Ctx<'_> {
             Ok(())
         }
     }
+
+    /// An I/O error raised by our own cancelling reader is reported as `Cancelled`.
+    fn io_error(&self, e: io::Error) -> Error {
+        if self.cancel.load(Ordering::Relaxed) {
+            Error::Cancelled
+        } else {
+            e.into()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -174,30 +190,61 @@ pub struct CreateOptions {
 pub fn list(path: &Path, ctx: &Ctx) -> Result<Vec<Entry>> {
     match detect(path)? {
         Format::Zip => formats::zip::list(path, ctx),
+        f @ (Format::Tar | Format::TarGz | Format::TarXz | Format::TarBz2 | Format::TarZst) => {
+            formats::tar::list(path, f)
+        }
+        f @ (Format::Gz | Format::Xz | Format::Bz2 | Format::Zst | Format::Lzma) => {
+            formats::stream::list(path, f)
+        }
         f => Err(unsupported(f)),
     }
 }
 
 /// Extracts into `dest`. Unsafe entries are skipped, not fatal; they come back as warnings.
 pub fn extract(path: &Path, dest: &Path, opts: &ExtractOptions, ctx: &Ctx) -> Result<Vec<String>> {
-    match detect(path)? {
-        Format::Zip => formats::zip::extract(path, Some(dest), opts, ctx),
-        f => Err(unsupported(f)),
-    }
+    run_extract(path, Some(dest), opts, ctx)
 }
 
 /// Decodes everything and verifies checksums without writing anything.
 pub fn test(path: &Path, ctx: &Ctx) -> Result<()> {
+    run_extract(path, None, &ExtractOptions::default(), ctx).map(drop)
+}
+
+fn run_extract(
+    path: &Path,
+    dest: Option<&Path>,
+    opts: &ExtractOptions,
+    ctx: &Ctx,
+) -> Result<Vec<String>> {
     match detect(path)? {
-        Format::Zip => formats::zip::extract(path, None, &ExtractOptions::default(), ctx).map(drop),
+        Format::Zip => formats::zip::extract(path, dest, opts, ctx),
+        f @ (Format::Tar | Format::TarGz | Format::TarXz | Format::TarBz2 | Format::TarZst) => {
+            formats::tar::extract(path, f, dest, opts, ctx)
+        }
+        f @ (Format::Gz | Format::Xz | Format::Bz2 | Format::Zst | Format::Lzma) => {
+            formats::stream::extract(path, f, dest, opts, ctx)
+        }
         f => Err(unsupported(f)),
     }
 }
 
 pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx) -> Result<()> {
+    if ctx.password.is_some() && !opts.format.encryptable() {
+        return Err(Error::Unsupported(format!(
+            "{} cannot be encrypted",
+            opts.format.name()
+        )));
+    }
     match opts.format {
         Format::Zip => formats::zip::create(sources, dest, opts, ctx),
-        f => Err(unsupported(f)),
+        Format::Tar | Format::TarGz | Format::TarXz | Format::TarBz2 => {
+            formats::tar::create(sources, dest, opts, ctx)
+        }
+        Format::Gz | Format::Xz | Format::Bz2 => formats::stream::create(sources, dest, opts, ctx),
+        f => Err(Error::Unsupported(format!(
+            "creating {} is not supported",
+            f.name()
+        ))),
     }
 }
 
@@ -220,6 +267,8 @@ struct Meter<'a> {
     ctx: &'a Ctx<'a>,
     done: u64,
     total: u64,
+    /// Streamed formats report compressed bytes consumed instead of bytes written.
+    consumed: Option<&'a Cell<u64>>,
     buf: Vec<u8>,
 }
 
@@ -229,7 +278,32 @@ impl<'a> Meter<'a> {
             ctx,
             done: 0,
             total,
+            consumed: None,
             buf: vec![0; 256 << 10],
+        }
+    }
+
+    /// Progress = `consumed` (fed by a `CountingRead` on the archive file) out of the archive size.
+    fn streamed(ctx: &'a Ctx<'a>, archive_size: u64, consumed: &'a Cell<u64>) -> Self {
+        Self {
+            consumed: Some(consumed),
+            ..Self::new(ctx, archive_size)
+        }
+    }
+
+    fn advance(&mut self, n: usize, name: &str) {
+        self.done += n as u64;
+        let shown = self.consumed.map_or(self.done, Cell::get);
+        (self.ctx.progress)(shown, self.total, name);
+    }
+
+    /// For APIs that pull from a reader (e.g. tar::Builder). Cancellation surfaces
+    /// as an I/O error; map it back with `Ctx::io_error`.
+    fn reader<'m, R: Read>(&'m mut self, name: &'m str, inner: R) -> MeterRead<'m, 'a, R> {
+        MeterRead {
+            meter: self,
+            name,
+            inner,
         }
     }
 
@@ -245,8 +319,7 @@ impl<'a> Meter<'a> {
             };
             w.write_all(&self.buf[..n])?;
             copied += n as u64;
-            self.done += n as u64;
-            (self.ctx.progress)(self.done, self.total, name);
+            self.advance(n, name);
         }
     }
 
@@ -264,6 +337,37 @@ impl<'a> Meter<'a> {
             return Err(Error::Corrupt(format!("{name}: size differs from header")));
         }
         Ok(())
+    }
+}
+
+struct MeterRead<'m, 'a, R> {
+    meter: &'m mut Meter<'a>,
+    name: &'m str,
+    inner: R,
+}
+
+impl<R: Read> Read for MeterRead<'_, '_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.meter.ctx.cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::other("cancelled"));
+        }
+        let n = self.inner.read(buf)?;
+        self.meter.advance(n, self.name);
+        Ok(n)
+    }
+}
+
+/// Counts bytes read from the archive file, for `Meter::streamed`.
+struct CountingRead<'a, R> {
+    inner: R,
+    count: &'a Cell<u64>,
+}
+
+impl<R: Read> Read for CountingRead<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count.set(self.count.get() + n as u64);
+        Ok(n)
     }
 }
 

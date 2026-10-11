@@ -6,6 +6,11 @@ edition.workspace = true
 [dependencies]
 zip = { workspace = true }
 jiff = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+bzip2 = { workspace = true }
+lzma-rust2 = { workspace = true }
+ruzstd = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

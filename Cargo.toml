@@ -11,8 +11,17 @@ hdec-core = { path = "crates/hdec-core" }
 # zip: never enable `zstd` (C). Rust backends only: zlib-rs, libbz2-rs-sys, lzma-rust2.
 zip = { version = "9.0.1", default-features = false, features = ["aes-crypto", "bzip2", "deflate-flate2-zlib-rs", "deflate64", "lzma", "xz", "ppmd", "jiff-02"] }
 jiff = "0.2"
+tar = "0.4.46"
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+bzip2 = "0.6.1"          # default backend is libbz2-rs-sys (pure Rust)
+lzma-rust2 = "0.21"      # same version zip uses
+ruzstd = "0.9.1"
 tempfile = "3"
 eframe = "0.36.2"
 egui_extras = "0.36.2"
 rfd = "0.17.2"
 zeroize = "1.9.1"
+
+# Compression crates are unusably slow unoptimized; keep our own code debuggable.
+[profile.dev.package."*"]
+opt-level = 2

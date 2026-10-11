@@ -9,7 +9,22 @@ use std::time::SystemTime;
 use zeroize::Zeroizing;
 
 /// Formats offered in the Create dialog (grows as core gains writers).
-const CREATE_FORMATS: &[Format] = &[Format::Zip];
+const CREATE_FORMATS: &[Format] = &[
+    Format::Zip,
+    Format::Tar,
+    Format::TarGz,
+    Format::TarXz,
+    Format::TarBz2,
+    Format::Gz,
+    Format::Xz,
+    Format::Bz2,
+];
+
+/// GZ/XZ/BZ2 compress exactly one file.
+fn fits(format: Format, sources: &[PathBuf]) -> bool {
+    !matches!(format, Format::Gz | Format::Xz | Format::Bz2)
+        || matches!(sources, [one] if one.is_file())
+}
 
 fn main() -> eframe::Result {
     let mut app = App::default();
@@ -251,7 +266,8 @@ impl App {
             level: form.level,
             zip_crypto: form.zip_crypto,
         };
-        let password = (!form.password.is_empty()).then(|| form.password.clone());
+        let password =
+            (form.format.encryptable() && !form.password.is_empty()).then(|| form.password.clone());
         self.status = format!("Creating {}", dest.display());
         self.spawn(ctx, None, password, move |c| {
             hdec_core::create(&form.sources, &dest, &opts, c)?;
@@ -397,19 +413,16 @@ impl App {
         ui.horizontal(|ui| match &self.job {
             Some(job) => {
                 let (done, total, name) = &job.progress;
-                let fraction = if *total > 0 {
-                    *done as f32 / *total as f32
-                } else {
-                    0.0
-                };
                 if ui.button("Cancel").clicked() {
                     job.cancel.store(true, Ordering::Relaxed);
                 }
-                ui.add(
-                    egui::ProgressBar::new(fraction)
-                        .text(name.as_str())
-                        .show_percentage(),
-                );
+                let bar = if *total > 0 {
+                    egui::ProgressBar::new((*done as f32 / *total as f32).min(1.0))
+                        .show_percentage()
+                } else {
+                    egui::ProgressBar::new(0.0).animate(true)
+                };
+                ui.add(bar.text(name.as_str()));
             }
             None => {
                 ui.label(&self.status);
@@ -595,7 +608,7 @@ fn create_form(ui: &mut egui::Ui, form: &mut CreateForm, result: &mut Option<boo
     egui::ComboBox::from_label("Format")
         .selected_text(form.format.name())
         .show_ui(ui, |ui| {
-            for f in CREATE_FORMATS {
+            for f in CREATE_FORMATS.iter().filter(|f| fits(**f, &form.sources)) {
                 ui.selectable_value(&mut form.format, *f, f.name());
             }
         });
@@ -613,23 +626,26 @@ fn create_form(ui: &mut egui::Ui, form: &mut CreateForm, result: &mut Option<boo
             ui.radio_value(&mut form.level, level, label);
         }
     });
-    egui::Grid::new("password").show(ui, |ui| {
-        ui.label("Password:");
-        ui.add(egui::TextEdit::singleline(&mut *form.password).password(true));
-        ui.end_row();
-        ui.label("Confirm:");
-        ui.add(egui::TextEdit::singleline(&mut *form.confirm).password(true));
-        ui.end_row();
-    });
-    let mismatch = form.password != form.confirm;
-    if mismatch {
-        ui.colored_label(ui.visuals().error_fg_color, "Passwords don't match.");
-    }
-    if form.format == Format::Zip && !form.password.is_empty() {
-        ui.checkbox(
-            &mut form.zip_crypto,
-            "Legacy ZipCrypto (weak; opens in Explorer / Archive Utility)",
-        );
+    let mut mismatch = false;
+    if form.format.encryptable() {
+        egui::Grid::new("password").show(ui, |ui| {
+            ui.label("Password:");
+            ui.add(egui::TextEdit::singleline(&mut *form.password).password(true));
+            ui.end_row();
+            ui.label("Confirm:");
+            ui.add(egui::TextEdit::singleline(&mut *form.confirm).password(true));
+            ui.end_row();
+        });
+        mismatch = form.password != form.confirm;
+        if mismatch {
+            ui.colored_label(ui.visuals().error_fg_color, "Passwords don't match.");
+        }
+        if form.format == Format::Zip && !form.password.is_empty() {
+            ui.checkbox(
+                &mut form.zip_crypto,
+                "Legacy ZipCrypto (weak; opens in Explorer / Archive Utility)",
+            );
+        }
     }
     ui.horizontal(|ui| {
         if ui
