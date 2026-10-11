@@ -7,11 +7,14 @@ use std::time::{Duration, SystemTime};
 
 fn noop(_: u64, _: u64, _: &str) {}
 
-fn ctx<'a>(password: Option<&'a str>, cancel: &'a AtomicBool) -> Ctx<'a> {
+/// `cancel` is copied: set it before building the context.
+fn ctx<'a>(password: Option<&'a str>, cancel: &AtomicBool) -> Ctx<'a> {
     Ctx {
         password,
-        cancel,
-        progress: &noop,
+        cancel: std::sync::Arc::new(AtomicBool::new(
+            cancel.load(std::sync::atomic::Ordering::Relaxed),
+        )),
+        progress: std::sync::Arc::new(noop),
     }
 }
 
@@ -756,4 +759,144 @@ fn sevenz_modify_keeps_password() {
     let out = tmp.path().join("x");
     extract(&archive, &out, Some("pw")).unwrap();
     assert!(out.join("tree/a.txt").exists() && !out.join("tree/zero.bin").exists());
+}
+
+fn big_pattern() -> Vec<u8> {
+    (0..300_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect()
+}
+
+fn check_rar_tree(root: &Path, name: &str) {
+    assert_eq!(
+        fs::read(root.join("tree/a.txt")).unwrap(),
+        b"hello",
+        "{name}"
+    );
+    assert_eq!(
+        fs::read(root.join("tree/sub/b.txt")).unwrap(),
+        b"world",
+        "{name}"
+    );
+    assert_eq!(
+        fs::read(root.join("tree/sub/ünï.txt")).unwrap(),
+        b"unicode",
+        "{name}"
+    );
+    assert_eq!(
+        fs::read(root.join("tree/big.bin")).unwrap(),
+        big_pattern(),
+        "{name}"
+    );
+    assert!(root.join("tree/empty").is_dir(), "{name}");
+}
+
+#[test]
+fn reads_rar5_with_symlinks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("d");
+    let warnings = extract(&fixture("rar5.rar"), &dest, None).unwrap();
+    check_rar_tree(&dest, "rar5");
+    assert_eq!(warnings.len(), 1, "{warnings:?}"); // tree/evil escapes
+    assert!(!tmp.path().join("outside").exists());
+    #[cfg(unix)]
+    assert_eq!(
+        fs::read_link(dest.join("tree/link")).unwrap(),
+        Path::new("a.txt")
+    );
+    let got = fs::metadata(dest.join("tree/a.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(
+        got,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000)
+    );
+    let cancel = AtomicBool::new(false);
+    let entries = hdec_core::list(&fixture("rar5.rar"), &ctx(None, &cancel)).unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.path == "tree/sub/ünï.txt" && e.size == 7)
+    );
+    hdec_core::test(&fixture("rar5.rar"), &ctx(None, &cancel)).unwrap();
+}
+
+#[test]
+fn reads_rar4() {
+    let tmp = tempfile::tempdir().unwrap();
+    extract(&fixture("rar4.rar"), tmp.path(), None).unwrap();
+    check_rar_tree(tmp.path(), "rar4");
+}
+
+#[test]
+fn rar_passwords() {
+    for name in [
+        "rar5_solid_pw.rar",
+        "rar5_headers_pw.rar",
+        "rar4_solid_pw.rar",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = fixture(name);
+        let r = extract(&archive, &tmp.path().join("a"), None);
+        assert!(matches!(r, Err(Error::PasswordRequired)), "{name}: {r:?}");
+        let r = extract(&archive, &tmp.path().join("b"), Some("wrong"));
+        assert!(matches!(r, Err(Error::WrongPassword)), "{name}: {r:?}");
+        extract(&archive, &tmp.path().join("c"), Some("secret")).unwrap();
+        check_rar_tree(&tmp.path().join("c"), name);
+        if tmp.path().join("b").exists() {
+            let leftovers = snapshot(&tmp.path().join("b"));
+            assert!(
+                leftovers.keys().all(|k| !k.contains("hdec-tmp")),
+                "{name}: {leftovers:?}"
+            );
+        }
+    }
+    let cancel = AtomicBool::new(false);
+    let r = hdec_core::list(&fixture("rar5_headers_pw.rar"), &ctx(None, &cancel));
+    assert!(matches!(r, Err(Error::PasswordRequired)), "{r:?}");
+}
+
+#[test]
+fn reads_rar_volume_sets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let want: Vec<u8> = (0..30_000u32).map(|i| (i % 251) as u8).collect();
+    for part in ["rar5_vol.part1.rar", "rar5_vol.part3.rar"] {
+        let out = tmp.path().join(part);
+        extract(&fixture(part), &out, None).unwrap();
+        assert_eq!(fs::read(out.join("spanned.bin")).unwrap(), want, "{part}");
+        assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"hello", "{part}");
+    }
+    let cancel = AtomicBool::new(false);
+    let entries = hdec_core::list(&fixture("rar5_vol.part2.rar"), &ctx(None, &cancel)).unwrap();
+    assert_eq!(
+        entries.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+        ["a.txt", "spanned.bin"]
+    );
+}
+
+#[test]
+fn rar_selection_and_corruption() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cancel = AtomicBool::new(false);
+    let opts = ExtractOptions {
+        only: Some(vec!["tree/sub".into()]),
+        ..Default::default()
+    };
+    hdec_core::extract(
+        &fixture("rar5_solid_pw.rar"),
+        tmp.path(),
+        &opts,
+        &ctx(Some("secret"), &cancel),
+    )
+    .unwrap();
+    assert!(tmp.path().join("tree/sub/b.txt").exists());
+    assert!(!tmp.path().join("tree/a.txt").exists());
+
+    let mut bytes = fs::read(fixture("rar4.rar")).unwrap();
+    let n = bytes.len();
+    bytes[n / 2] ^= 0xFF;
+    let bad = tmp.path().join("bad.rar");
+    fs::write(&bad, bytes).unwrap();
+    assert!(hdec_core::test(&bad, &ctx(None, &cancel)).is_err());
 }

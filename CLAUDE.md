@@ -18,7 +18,7 @@ for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc aarch64
 ```
 
 ## Hard rules
-- **No C/C++ in the dependency tree.** Before adding a crate, check it (and its features) doesn't build C. `zip`: `default-features = false`, never enable `zstd`. `bzip2`/`flate2`: Rust backends only.
+- **No C/C++ in the dependency tree.** Before adding a crate, check it (and its features) doesn't build C. `zip`: `default-features = false`, never enable `zstd`. `sevenz-rust2`: never `zstd`. `rars`: never `write`. `bzip2`/`flate2`: Rust backends only.
 - **Every filesystem path derived from an archive goes through `safe_path::join`.** No exceptions, including symlink targets.
 - **Never overwrite** a source archive or existing file in place: write `*.hdec-tmp`, then rename; remove partials on error/cancel.
 - Passwords: `Zeroizing<String>`, never logged, never persisted.
@@ -31,5 +31,5 @@ for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc aarch64
 - Long operations take `&Ctx` (password, cancel flag, progress callback) and check `cancel` between entries/blocks.
 - Free functions per format module; no traits until a second real use exists.
 - Tests: unit tests inline; per-format round-trip + fixture tests in `crates/hdec-core/tests/`. Fixtures are tiny, made by external tools, generator commands in `tests/fixtures/README.md`. Malicious fixtures (zip-slip, symlink escape, bomb, truncated) are required for every format.
-- Self-written parsers (RAR, …) get a `fuzz/` target.
+- Self-written parsers get a `fuzz/` target (none so far; RAR uses the `rars` crate, read-only features only).
 - After finishing a phase, tick it in PLAN.md §4 and add any decision to §8.

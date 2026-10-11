@@ -16,7 +16,7 @@ Cross-platform GUI archiver for macOS (arm64, x86_64) and Windows (x64, arm64), 
 Everything above, plus:
 | Format | Crate / note |
 |---|---|
-| RAR4, RAR5 (incl. encrypted, multi-volume `.partN.rar` / `.rNN`) | **own decoder** (`formats/rar/`) |
+| RAR 1.3–7 (incl. encrypted, encrypted headers, multi-volume `.partN.rar` / `.rNN`) | `rars` (pure Rust, Apache-2.0), read-only features |
 | ZIP methods Deflate64, BZip2, LZMA, XZ, PPMd (Zstd deferred: rare in ZIP, needs a raw-read path because `zip`'s zstd feature is C) | `zip` features |
 | ZST, TAR.ZST, LZMA | `ruzstd`, `lzma-rust2` |
 | JAR, APK, XPI, EPUB, … | ZIP, detected by magic bytes |
@@ -59,10 +59,9 @@ HDEC/
     src/formats/sevenz.rs
     src/formats/tar.rs       tar + tar.gz/xz/bz2/zst
     src/formats/stream.rs    single-stream gz/xz/bz2/zst/lzma
-    src/formats/rar/         own RAR decoder
+    src/formats/rar.rs       adapter over `rars`
     tests/                   integration tests + fixtures/
   crates/hdec-gui/           binary `hdec` (eframe/egui)
-  fuzz/                      cargo-fuzz targets (from P6)
 ```
 
 Files appear when a phase needs them, not before.
@@ -111,16 +110,14 @@ Each phase ends with: `cargo fmt --check`, `cargo clippy --all-targets -- -D war
 | P3 ✅ | TAR + streams | tar, tar.gz/xz/bz2/zst, gz/xz/bz2/zst/lzma | round-trip + fixtures from bsdtar/GNU tar (incl. long names, pax headers, symlinks) |
 | P4 ✅ | 7Z | list / extract / create, AES, header encryption, solid | 7-Zip opens our output; we open 7-Zip's (LZMA, LZMA2, BCJ, PPMd if crate supports, encrypted) |
 | P5 ✅ | Volumes + modify | split write, `.001` / spanned-ZIP read, add/delete/rename | split → join → identical; modify keeps untouched ZIP entries byte-identical |
-| P6 | RAR5 | list / extract / test, encryption, multi-volume, `fuzz/` harness | all RAR5 fixtures decode with matching CRC; 1 h fuzz run clean |
-| P7 | RAR3/4 | LZ + PPMd var.H + RarVM standard filters, AES-128, old volumes | RAR 2.9–4.x fixtures decode; fuzz clean |
+| P6+P7 ✅ | RAR | list / extract / test for RAR 1.3–7 via `rars`: encryption, encrypted headers, solid, multi-volume, symlinks | fixtures decode; **still to do: fixtures from real WinRAR** |
 | P8 | Extras | SFX scan, legacy filename encodings (CP437/CP866/Shift-JIS via `encoding_rs`), optional: Z, LZ, BR, CAB, DEB | per-item fixture tests |
 | P9 | Release | file associations, context menu (Windows registry verbs, macOS Services), icons, `cargo-packager` (.dmg / .msi), signing + notarization, CI on macos + windows | signed installers install and open archives by double-click |
 
-### RAR notes (P6–P7, largest risk)
-- Port from libarchive's BSD-licensed `archive_read_support_format_rar5.c` / `_rar.c`; unRAR source as reference only (its license allows decompressors, forbids recreating the compressor).
-- RAR5 first: simpler LZ + Huffman, filters (Delta, E8, E8E9, ARM).
-- RAR3/4: LZ, PPMd variant H, RarVM; implement only the standard filters recognised by hash (as libarchive does), no general VM.
-- Fixtures must be generated with real WinRAR / `rar` (RARLAB trial) — commit them, do not need `rar` in CI.
+### RAR notes
+- Found `rars` (crates.io, Apache-2.0, pure Rust) after planning: reads RAR 1.3 through 7. We use it with `default-features = false, features = ["encryption"]`, so no RAR encoder is compiled in.
+- Risk: young crate ("agentic development experiment" per its README). Mitigation: our fixtures, real-WinRAR fixtures once available, and fuzzing if bugs show up.
+- `extract_to` skips RAR5 redirections; `formats/rar.rs` recreates symlinks from member metadata (hard links/junctions/file copies are reported as skipped).
 
 ## 5. Extraction safety (`safe_path`)
 - Reject: absolute paths, `..` components, Windows drive / UNC / `\\?\` prefixes, NUL bytes. Normalise `\` → `/`.
@@ -133,12 +130,12 @@ Each phase ends with: `cargo fmt --check`, `cargo clippy --all-targets -- -D war
 - Unit tests next to the code (`safe_path`, `volume`, detection).
 - `crates/hdec-core/tests/`: round-trip per format × (store, max level, password, unicode names, empty dirs, 0-byte files, >4 GB sparse/ZIP64 where cheap).
 - `tests/fixtures/`: small archives made by external tools (7-Zip, WinRAR, Explorer, bsdtar, macOS `zip`/`ditto`), plus malicious ones (zip-slip, symlink escape, bomb, truncated, wrong CRC). Keep each fixture tiny; generator commands go in `fixtures/README.md`.
-- Fuzz every parser we write ourselves (RAR, later Z/LZ).
+- Fuzz every parser we write ourselves (none yet; RAR comes from `rars`).
 
 ## 7. Risks
 | Risk | Mitigation |
 |---|---|
-| RAR decoder takes longer than planned | ship P0–P5 first; RAR is additive |
+| `rars` is young | fixtures + real-WinRAR fixtures; swap/patch upstream if it misbehaves |
 | `zip` crate majors churn (v9 now) | pin versions in workspace; no default features |
 | `zip` crate's zstd feature pulls C | disable it; decode Zstd entries ourselves via raw reader + `ruzstd` |
 | `lzma-rust2` slower than liblzma | acceptable; multithreaded LZMA2 later if needed |
@@ -146,6 +143,7 @@ Each phase ends with: `cargo fmt --check`, `cargo clippy --all-targets -- -D war
 | Notarization / Authenticode need paid certs | needed only at P9 |
 
 ## 8. Decisions log
+- 2026-10-11: RAR via `rars` instead of a hand-written decoder (P6–P7 collapsed). `Ctx` cancel/progress became `Arc`s because `rars` wants `'static` writers.
 - 2026-10-11: Split = create whole archive, then cut into parts (needs 2× disk briefly). Modify: ZIP raw-copies entries; 7Z/TAR extract to a scratch dir next to the archive, edit, re-create at Normal level; refuses if any entry would be skipped as unsafe.
 - 2026-10-11: 7Z: solid blocks of 256 MiB, file names always encrypted when a password is set, unix modes/symlinks stored p7zip-style (attribute 0x8000 + st_mode<<16). Interop verified against bsdtar (libarchive) both ways; AES interop with real 7-Zip still to do.
 - 2026-10-11: Streamed formats (tar.*, gz/xz/bz2/zst/lzma) report progress as compressed bytes read; LZMA/XZ dictionaries over 2 GiB are refused. Hard links in tar are only created to targets inside the destination.

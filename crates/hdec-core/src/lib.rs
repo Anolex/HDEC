@@ -1,4 +1,5 @@
 mod formats {
+    pub mod rar;
     pub mod sevenz;
     pub mod stream;
     pub mod tar;
@@ -12,6 +13,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
@@ -130,11 +132,15 @@ pub struct Entry {
     pub encrypted: bool,
 }
 
-/// Per-operation context. `progress(done_bytes, total_bytes, current_entry)`.
+/// `progress(done_bytes, total_bytes, current_entry)`.
+pub type ProgressFn = dyn Fn(u64, u64, &str) + Send + Sync;
+
+/// Per-operation context. Cancel and progress are shared (`Arc`) because some
+/// decoders take `'static` writers that must report progress themselves.
 pub struct Ctx<'a> {
     pub password: Option<&'a str>,
-    pub cancel: &'a AtomicBool,
-    pub progress: &'a dyn Fn(u64, u64, &str),
+    pub cancel: Arc<AtomicBool>,
+    pub progress: Arc<ProgressFn>,
 }
 
 impl Ctx<'_> {
@@ -206,13 +212,13 @@ pub fn list(path: &Path, ctx: &Ctx) -> Result<Vec<Entry>> {
     match detect(path)? {
         Format::Zip => formats::zip::list(path, ctx),
         Format::SevenZ => formats::sevenz::list(path, ctx),
+        Format::Rar => formats::rar::list(path, ctx),
         f @ (Format::Tar | Format::TarGz | Format::TarXz | Format::TarBz2 | Format::TarZst) => {
             formats::tar::list(path, f)
         }
         f @ (Format::Gz | Format::Xz | Format::Bz2 | Format::Zst | Format::Lzma) => {
             formats::stream::list(path, f)
         }
-        f => Err(unsupported(f)),
     }
 }
 
@@ -235,13 +241,13 @@ fn run_extract(
     match detect(path)? {
         Format::Zip => formats::zip::extract(path, dest, opts, ctx),
         Format::SevenZ => formats::sevenz::extract(path, dest, opts, ctx),
+        Format::Rar => formats::rar::extract(path, dest, opts, ctx),
         f @ (Format::Tar | Format::TarGz | Format::TarXz | Format::TarBz2 | Format::TarZst) => {
             formats::tar::extract(path, f, dest, opts, ctx)
         }
         f @ (Format::Gz | Format::Xz | Format::Bz2 | Format::Zst | Format::Lzma) => {
             formats::stream::extract(path, f, dest, opts, ctx)
         }
-        f => Err(unsupported(f)),
     }
 }
 
@@ -353,10 +359,6 @@ fn rewrite(path: &Path, format: Format, edit: &Edit, ctx: &Ctx) -> Result<()> {
     create(&sources, path, &opts, ctx)
 }
 
-fn unsupported(f: Format) -> Error {
-    Error::Unsupported(format!("{} is not supported yet", f.name()))
-}
-
 fn is_selected(name: &str, only: Option<&[String]>) -> bool {
     let name = name.trim_end_matches('/');
     only.is_none_or(|sel| {
@@ -399,7 +401,7 @@ impl<'a> Meter<'a> {
     fn advance(&self, n: usize, name: &str) {
         self.done.set(self.done.get() + n as u64);
         let shown = self.consumed.map_or(self.done.get(), Cell::get);
-        (self.ctx.progress)(shown, self.total, name);
+        (*self.ctx.progress)(shown, self.total, name);
     }
 
     /// For APIs that pull from a reader (e.g. tar::Builder). Cancellation surfaces

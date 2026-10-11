@@ -159,14 +159,14 @@ impl App {
         let (thread_cancel, thread_password, egui_ctx) =
             (cancel.clone(), password.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let progress = |done, total, name: &str| {
-                let _ = tx.send(Msg::Progress(done, total, name.to_owned()));
-                egui_ctx.request_repaint();
-            };
+            let (progress_tx, progress_ctx) = (tx.clone(), egui_ctx.clone());
             let c = Ctx {
                 password: thread_password.as_deref().map(String::as_str),
-                cancel: &thread_cancel,
-                progress: &progress,
+                cancel: thread_cancel,
+                progress: Arc::new(move |done, total, name: &str| {
+                    let _ = progress_tx.send(Msg::Progress(done, total, name.to_owned()));
+                    progress_ctx.request_repaint();
+                }),
             };
             let _ = tx.send(Msg::Done(work(&c)));
             egui_ctx.request_repaint();
