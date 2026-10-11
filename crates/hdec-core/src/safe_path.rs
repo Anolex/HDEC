@@ -35,6 +35,25 @@ fn join_for(dest: &Path, name: &str, windows: bool) -> Result<PathBuf> {
     if pushed { Ok(out) } else { Err(unsafe_path()) }
 }
 
+/// True if a symlink at `link` (relative to the extraction dir) pointing to
+/// `target` resolves, lexically, to somewhere inside the extraction dir.
+pub fn link_stays_inside(link: &Path, target: &str) -> bool {
+    let target = target.replace('\\', "/");
+    if target.starts_with('/') || target.contains('\0') || target.contains(':') {
+        return false;
+    }
+    let mut depth = link.parent().map_or(0, |p| p.components().count());
+    for c in target.split('/') {
+        match c {
+            "" | "." => {}
+            ".." if depth == 0 => return false,
+            ".." => depth -= 1,
+            _ => depth += 1,
+        }
+    }
+    true
+}
+
 /// Makes one path component legal and harmless on Windows: no drive letters or
 /// alternate data streams (`:`), no reserved device names, no trailing dots or
 /// spaces (Windows strips those, which would turn `.. ` into `..`).
@@ -128,6 +147,21 @@ mod tests {
         assert_eq!(ok(".. ", true), Path::new("/dest/_"));
         assert_eq!(ok("...", true), Path::new("/dest/_"));
         assert_eq!(ok("a<b>?", true), Path::new("/dest/a_b__"));
+    }
+
+    #[test]
+    fn checks_symlink_targets() {
+        let inside = |link: &str, target: &str| link_stays_inside(Path::new(link), target);
+        assert!(inside("a/link", "b.txt"));
+        assert!(inside("a/link", "../b.txt"));
+        assert!(inside("a/b/link", "../../c"));
+        assert!(inside("a/link", "x/../../y"));
+        assert!(!inside("link", "../x"));
+        assert!(!inside("a/link", "../../x"));
+        assert!(!inside("a/link", "x/../../../y"));
+        assert!(!inside("link", "/etc/passwd"));
+        assert!(!inside("link", "C:\\Windows"));
+        assert!(!inside("link", "..\\x"));
     }
 
     #[test]

@@ -17,7 +17,7 @@ Everything above, plus:
 | Format | Crate / note |
 |---|---|
 | RAR4, RAR5 (incl. encrypted, multi-volume `.partN.rar` / `.rNN`) | **own decoder** (`formats/rar/`) |
-| ZIP methods Deflate64, BZip2, LZMA, XZ, Zstd | `deflate64`, `bzip2`, `lzma-rust2`, `ruzstd` |
+| ZIP methods Deflate64, BZip2, LZMA, XZ, PPMd (Zstd deferred: rare in ZIP, needs a raw-read path because `zip`'s zstd feature is C) | `zip` features |
 | ZST, TAR.ZST, LZMA | `ruzstd`, `lzma-rust2` |
 | JAR, APK, XPI, EPUB, … | ZIP, detected by magic bytes |
 | SFX `.exe` (ZIP/7Z/RAR) | scan for embedded signature |
@@ -94,7 +94,7 @@ Dispatch is a `match format` in `lib.rs`. Each format module exposes the same fr
 - Main window: toolbar (Open, New, Extract, Add, Delete, Test), breadcrumb path inside the archive, entry table (name, size, packed, modified, 🔒), status bar with progress + Cancel.
 - Drag & drop: archive → open it; other files → Create dialog.
 - Create dialog: name, format, level, password + confirm, ZIP cipher (AES-256 / ZipCrypto), encrypt names (7Z), split size.
-- Extract dialog: destination, "to subfolder" toggle, overwrite policy (ask / skip / overwrite / rename).
+- Extract dialog: destination, "to subfolder" toggle, overwrite policy (skip / replace / rename).
 - Password modal on `PasswordRequired` / `WrongPassword`, then retry.
 - Work runs on a `std::thread`; progress over `mpsc`; `ctx.request_repaint()`.
 - `hdec <archive>` opens it (needed for file associations).
@@ -106,7 +106,7 @@ Each phase ends with: `cargo fmt --check`, `cargo clippy --all-targets -- -D war
 | # | Phase | Deliverable | Done when |
 |---|---|---|---|
 | P0 ✅ | Scaffold | workspace, `Error`, `Format` + `detect`, `safe_path` + tests, egui window with empty table | window opens; checks green; pure-Rust check verified |
-| P1 | ZIP | list / extract / test / create; all read methods; AES + ZipCrypto | round-trip tests; reads fixtures from macOS `zip`, 7-Zip, Windows Explorer; Explorer/Archive Utility open our ZipCrypto output |
+| P1 ✅ | ZIP | list / extract / test / create; all read methods; AES + ZipCrypto | round-trip tests; reads fixtures from macOS `zip`, 7-Zip, Windows Explorer; Explorer/Archive Utility open our ZipCrypto output |
 | P2 | GUI MVP | browse, extract (all/selected), create ZIP, drag & drop, progress/cancel, password modal | usable for daily ZIP work on macOS + Windows |
 | P3 | TAR + streams | tar, tar.gz/xz/bz2/zst, gz/xz/bz2/zst/lzma | round-trip + fixtures from bsdtar/GNU tar (incl. long names, pax headers, symlinks) |
 | P4 | 7Z | list / extract / create, AES, header encryption, solid | 7-Zip opens our output; we open 7-Zip's (LZMA, LZMA2, BCJ, PPMd if crate supports, encrypted) |
@@ -146,5 +146,7 @@ Each phase ends with: `cargo fmt --check`, `cargo clippy --all-targets -- -D war
 | Notarization / Authenticode need paid certs | needed only at P9 |
 
 ## 8. Decisions log
+- 2026-10-11: Unsafe entries (traversal, escaping symlinks) are skipped and returned as warnings, not fatal. Overwrite policy is chosen up front (no mid-extraction "ask").
+- 2026-10-11: ZIP times are written as local wall-clock (DOS) via `jiff`'s system tz.
 - 2026-10-11: eframe 0.36 uses the new `App::ui(&mut Ui)` API and `egui::Panel` (not `TopBottomPanel`).
 - 2026-10-11: 100% Rust; GUI = egui/eframe; two crates (core + gui); free functions + `match` dispatch; scope per §1.

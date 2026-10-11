@@ -1,9 +1,15 @@
+mod formats {
+    pub mod zip;
+}
+mod fs;
 pub mod safe_path;
 
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read};
-use std::path::Path;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 #[derive(Debug)]
 pub enum Error {
@@ -84,6 +90,164 @@ impl Format {
     }
 }
 
+/// One archive member.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    /// '/'-separated, no trailing slash.
+    pub path: String,
+    pub size: u64,
+    pub packed: Option<u64>,
+    pub modified: Option<SystemTime>,
+    pub is_dir: bool,
+    pub encrypted: bool,
+}
+
+/// Per-operation context. `progress(done_bytes, total_bytes, current_entry)`.
+pub struct Ctx<'a> {
+    pub password: Option<&'a str>,
+    pub cancel: &'a AtomicBool,
+    pub progress: &'a dyn Fn(u64, u64, &str),
+}
+
+impl Ctx<'_> {
+    fn check(&self) -> Result<()> {
+        if self.cancel.load(Ordering::Relaxed) {
+            Err(Error::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Overwrite {
+    #[default]
+    Skip,
+    Replace,
+    Rename,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExtractOptions {
+    /// Entry paths to extract (a directory selects everything below it); `None` = all.
+    pub only: Option<Vec<String>>,
+    pub overwrite: Overwrite,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Level {
+    Store,
+    Fast,
+    #[default]
+    Normal,
+    Max,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateOptions {
+    pub format: Format,
+    pub level: Level,
+    /// ZIP only: legacy ZipCrypto instead of AES-256. Weak, but the only
+    /// encryption Windows Explorer and macOS Archive Utility can open.
+    pub zip_crypto: bool,
+}
+
+pub fn list(path: &Path, ctx: &Ctx) -> Result<Vec<Entry>> {
+    match detect(path)? {
+        Format::Zip => formats::zip::list(path, ctx),
+        f => Err(unsupported(f)),
+    }
+}
+
+/// Extracts into `dest`. Unsafe entries are skipped, not fatal; they come back as warnings.
+pub fn extract(path: &Path, dest: &Path, opts: &ExtractOptions, ctx: &Ctx) -> Result<Vec<String>> {
+    match detect(path)? {
+        Format::Zip => formats::zip::extract(path, Some(dest), opts, ctx),
+        f => Err(unsupported(f)),
+    }
+}
+
+/// Decodes everything and verifies checksums without writing anything.
+pub fn test(path: &Path, ctx: &Ctx) -> Result<()> {
+    match detect(path)? {
+        Format::Zip => formats::zip::extract(path, None, &ExtractOptions::default(), ctx).map(drop),
+        f => Err(unsupported(f)),
+    }
+}
+
+pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx) -> Result<()> {
+    match opts.format {
+        Format::Zip => formats::zip::create(sources, dest, opts, ctx),
+        f => Err(unsupported(f)),
+    }
+}
+
+fn unsupported(f: Format) -> Error {
+    Error::Unsupported(format!("{} is not supported yet", f.name()))
+}
+
+fn is_selected(name: &str, only: Option<&[String]>) -> bool {
+    let name = name.trim_end_matches('/');
+    only.is_none_or(|sel| {
+        sel.iter().any(|s| {
+            name.strip_prefix(s.as_str())
+                .is_some_and(|r| r.is_empty() || r.starts_with('/'))
+        })
+    })
+}
+
+/// Copies entry data while reporting progress and honouring cancellation.
+struct Meter<'a> {
+    ctx: &'a Ctx<'a>,
+    done: u64,
+    total: u64,
+    buf: Vec<u8>,
+}
+
+impl<'a> Meter<'a> {
+    fn new(ctx: &'a Ctx<'a>, total: u64) -> Self {
+        Self {
+            ctx,
+            done: 0,
+            total,
+            buf: vec![0; 256 << 10],
+        }
+    }
+
+    fn copy(&mut self, name: &str, r: &mut impl Read, w: &mut impl Write) -> Result<u64> {
+        let mut copied = 0;
+        loop {
+            self.ctx.check()?;
+            let n = match r.read(&mut self.buf) {
+                Ok(0) => return Ok(copied),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            };
+            w.write_all(&self.buf[..n])?;
+            copied += n as u64;
+            self.done += n as u64;
+            (self.ctx.progress)(self.done, self.total, name);
+        }
+    }
+
+    /// Copies exactly `size` bytes, then reads to EOF so the decoder verifies its
+    /// checksum. More data than declared is an error, never written (bomb guard).
+    fn copy_sized(
+        &mut self,
+        name: &str,
+        r: &mut impl Read,
+        w: &mut impl Write,
+        size: u64,
+    ) -> Result<()> {
+        let n = self.copy(name, &mut r.by_ref().take(size), w)?;
+        if n != size || r.read(&mut [0])? != 0 {
+            return Err(Error::Corrupt(format!("{name}: size differs from header")));
+        }
+        Ok(())
+    }
+}
+
 /// Detects the format by magic bytes; the file name only decides tar-vs-plain
 /// for compressed streams and covers formats without magic (v7 tar, .lzma).
 pub fn detect(path: &Path) -> Result<Format> {
@@ -117,6 +281,20 @@ fn detect_bytes(head: &[u8], name: &str) -> Option<Format> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selects_entries_and_subtrees() {
+        let sel = vec!["a".to_string(), "b/c.txt".to_string()];
+        let only = Some(sel.as_slice());
+        assert!(is_selected("a", only));
+        assert!(is_selected("a/", only));
+        assert!(is_selected("a/x/y", only));
+        assert!(is_selected("b/c.txt", only));
+        assert!(!is_selected("ab", only));
+        assert!(!is_selected("b/c.txt2", only));
+        assert!(!is_selected("b", only));
+        assert!(is_selected("anything", None));
+    }
 
     #[test]
     fn detects_by_magic_and_name() {
