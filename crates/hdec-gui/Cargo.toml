@@ -11,3 +11,6 @@ path = "src/main.rs"
 hdec-core.workspace = true
 eframe.workspace = true
 egui_extras.workspace = true
+rfd.workspace = true
+zeroize.workspace = true
+jiff.workspace = true

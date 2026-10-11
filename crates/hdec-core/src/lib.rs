@@ -88,6 +88,25 @@ impl Format {
             Format::Lzma => "LZMA",
         }
     }
+
+    /// File extension without the leading dot.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::Zip => "zip",
+            Format::SevenZ => "7z",
+            Format::Rar => "rar",
+            Format::Tar => "tar",
+            Format::TarGz => "tar.gz",
+            Format::TarXz => "tar.xz",
+            Format::TarBz2 => "tar.bz2",
+            Format::TarZst => "tar.zst",
+            Format::Gz => "gz",
+            Format::Xz => "xz",
+            Format::Bz2 => "bz2",
+            Format::Zst => "zst",
+            Format::Lzma => "lzma",
+        }
+    }
 }
 
 /// One archive member.
