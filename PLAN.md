@@ -18,7 +18,7 @@ Everything above, plus:
 |---|---|
 | RAR 1.3–7 (incl. encrypted, encrypted headers, multi-volume `.partN.rar` / `.rNN`) | `rars` (pure Rust, Apache-2.0), read-only features |
 | ZIP methods Deflate64, BZip2, LZMA, XZ, PPMd (Zstd deferred: rare in ZIP, needs a raw-read path because `zip`'s zstd feature is C) | `zip` features |
-| ZST, TAR.ZST, LZMA | `ruzstd`, `lzma-rust2` |
+| ZST, TAR.ZST, LZMA, LZ, TAR.LZ | `ruzstd`, `lzma-rust2` |
 | JAR, APK, XPI, EPUB, … | ZIP, detected by magic bytes |
 | SFX `.exe` (ZIP/7Z/RAR) | scan for embedded signature |
 
@@ -111,7 +111,7 @@ Each phase ends with: `cargo fmt --check`, `cargo clippy --all-targets -- -D war
 | P4 ✅ | 7Z | list / extract / create, AES, header encryption, solid | 7-Zip opens our output; we open 7-Zip's (LZMA, LZMA2, BCJ, PPMd if crate supports, encrypted) |
 | P5 ✅ | Volumes + modify | split write, `.001` / spanned-ZIP read, add/delete/rename | split → join → identical; modify keeps untouched ZIP entries byte-identical |
 | P6+P7 ✅ | RAR | list / extract / test for RAR 1.3–7 via `rars`: encryption, encrypted headers, solid, multi-volume, symlinks | fixtures decode; **still to do: fixtures from real WinRAR** |
-| P8 | Extras | SFX scan, legacy filename encodings (CP437/CP866/Shift-JIS via `encoding_rs`), optional: Z, LZ, BR, CAB, DEB | per-item fixture tests |
+| P8 ✅ | Extras | SFX `.exe` (7Z with header-CRC check, RAR via `rars`, ZIP via EOCD) and LZ / TAR.LZ. Deferred until asked: legacy filename code pages, Z, BR, CAB, DEB | per-item tests |
 | P9 | Release | file associations, context menu (Windows registry verbs, macOS Services), icons, `cargo-packager` (.dmg / .msi), signing + notarization, CI on macos + windows | signed installers install and open archives by double-click |
 
 ### RAR notes

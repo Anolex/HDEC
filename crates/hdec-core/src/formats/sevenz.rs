@@ -1,6 +1,7 @@
 //! 7z via sevenz-rust2.
 
 use crate::fs::{self as hfs, OutFile, Source};
+use crate::sfx::{self, Skip};
 use crate::volume::Volume;
 use crate::{CreateOptions, Ctx, Entry, Error, ExtractOptions, Level, Meter, Result, safe_path};
 use sevenz_rust2::encoder_options::{AesEncoderOptions, Lzma2Options};
@@ -9,7 +10,7 @@ use sevenz_rust2::{
     NtTime, Password, SourceReader,
 };
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// p7zip / 7-Zip convention: this attribute bit means the high 16 bits hold `st_mode`.
@@ -51,10 +52,20 @@ fn password_hint(e: Error, ctx: &Ctx) -> Error {
     }
 }
 
-fn open(path: &Path, ctx: &Ctx) -> Result<ArchiveReader<BufReader<Volume>>> {
+type Reader = ArchiveReader<Skip<BufReader<Volume>>>;
+
+fn open(path: &Path, ctx: &Ctx) -> Result<Reader> {
     let password = ctx.password.map_or_else(Password::empty, Password::new);
-    ArchiveReader::new(BufReader::new(Volume::open(path)?), password)
-        .map_err(|e| password_hint(e.into(), ctx))
+    let mut inner = BufReader::new(Volume::open(path)?);
+    let mut sig = [0; 2];
+    inner.read_exact(&mut sig)?;
+    let base = match sig {
+        [b'M', b'Z'] => sfx::find(&mut inner)?.map_or(0, |(_, offset)| offset),
+        _ => 0,
+    };
+    let mut src = Skip { inner, base };
+    src.seek(SeekFrom::Start(0))?;
+    ArchiveReader::new(src, password).map_err(|e| password_hint(e.into(), ctx))
 }
 
 fn name(f: &ArchiveEntry) -> String {

@@ -9,7 +9,7 @@ use bzip2::read::MultiBzDecoder;
 use bzip2::write::BzEncoder;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
-use lzma_rust2::{LzmaReader, XzOptions, XzReader, XzWriter};
+use lzma_rust2::{LzipReader, LzmaReader, XzOptions, XzReader, XzWriter};
 use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
 use std::cell::Cell;
 use std::fs::{self, File};
@@ -27,6 +27,7 @@ pub(crate) fn decoder<'a>(format: Format, r: impl BufRead + 'a) -> Result<Box<dy
         Format::Xz | Format::TarXz => Box::new(XzReader::new_mem_limit(r, true, MEM_LIMIT_KB)),
         Format::Zst | Format::TarZst => Box::new(ZstReader::new(r)?),
         Format::Lzma => Box::new(LzmaReader::new_mem_limit(r, MEM_LIMIT_KB, None)?),
+        Format::Lz | Format::TarLz => Box::new(LzipReader::new(r)),
         f => unreachable!("{f:?} is not a stream format"),
     })
 }

@@ -7,10 +7,12 @@ mod formats {
 }
 mod fs;
 pub mod safe_path;
+mod sfx;
 mod volume;
 
 use std::cell::Cell;
 use std::fmt;
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -70,10 +72,12 @@ pub enum Format {
     TarXz,
     TarBz2,
     TarZst,
+    TarLz,
     Gz,
     Xz,
     Bz2,
     Zst,
+    Lz,
     Lzma,
 }
 
@@ -88,10 +92,12 @@ impl Format {
             Format::TarXz => "TAR.XZ",
             Format::TarBz2 => "TAR.BZ2",
             Format::TarZst => "TAR.ZST",
+            Format::TarLz => "TAR.LZ",
             Format::Gz => "GZ",
             Format::Xz => "XZ",
             Format::Bz2 => "BZ2",
             Format::Zst => "ZST",
+            Format::Lz => "LZ",
             Format::Lzma => "LZMA",
         }
     }
@@ -111,10 +117,12 @@ impl Format {
             Format::TarXz => "tar.xz",
             Format::TarBz2 => "tar.bz2",
             Format::TarZst => "tar.zst",
+            Format::TarLz => "tar.lz",
             Format::Gz => "gz",
             Format::Xz => "xz",
             Format::Bz2 => "bz2",
             Format::Zst => "zst",
+            Format::Lz => "lz",
             Format::Lzma => "lzma",
         }
     }
@@ -213,10 +221,13 @@ pub fn list(path: &Path, ctx: &Ctx) -> Result<Vec<Entry>> {
         Format::Zip => formats::zip::list(path, ctx),
         Format::SevenZ => formats::sevenz::list(path, ctx),
         Format::Rar => formats::rar::list(path, ctx),
-        f @ (Format::Tar | Format::TarGz | Format::TarXz | Format::TarBz2 | Format::TarZst) => {
-            formats::tar::list(path, f)
-        }
-        f @ (Format::Gz | Format::Xz | Format::Bz2 | Format::Zst | Format::Lzma) => {
+        f @ (Format::Tar
+        | Format::TarGz
+        | Format::TarXz
+        | Format::TarBz2
+        | Format::TarZst
+        | Format::TarLz) => formats::tar::list(path, f),
+        f @ (Format::Gz | Format::Xz | Format::Bz2 | Format::Zst | Format::Lz | Format::Lzma) => {
             formats::stream::list(path, f)
         }
     }
@@ -242,10 +253,13 @@ fn run_extract(
         Format::Zip => formats::zip::extract(path, dest, opts, ctx),
         Format::SevenZ => formats::sevenz::extract(path, dest, opts, ctx),
         Format::Rar => formats::rar::extract(path, dest, opts, ctx),
-        f @ (Format::Tar | Format::TarGz | Format::TarXz | Format::TarBz2 | Format::TarZst) => {
-            formats::tar::extract(path, f, dest, opts, ctx)
-        }
-        f @ (Format::Gz | Format::Xz | Format::Bz2 | Format::Zst | Format::Lzma) => {
+        f @ (Format::Tar
+        | Format::TarGz
+        | Format::TarXz
+        | Format::TarBz2
+        | Format::TarZst
+        | Format::TarLz) => formats::tar::extract(path, f, dest, opts, ctx),
+        f @ (Format::Gz | Format::Xz | Format::Bz2 | Format::Zst | Format::Lz | Format::Lzma) => {
             formats::stream::extract(path, f, dest, opts, ctx)
         }
     }
@@ -279,6 +293,7 @@ pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx)
 /// True if `path` can be changed with [`modify`].
 pub fn modifiable(path: &Path) -> bool {
     volume::base_path(path).is_none()
+        && !is_exe(path)
         && matches!(
             detect(path),
             Ok(Format::Zip
@@ -481,10 +496,9 @@ impl<R: Read> Read for CountingRead<'_, R> {
 /// Detects the format by magic bytes; the file name only decides tar-vs-plain
 /// for compressed streams and covers formats without magic (v7 tar, .lzma).
 pub fn detect(path: &Path) -> Result<Format> {
+    let mut volume = volume::Volume::open(path)?;
     let mut head = Vec::with_capacity(512);
-    volume::Volume::open(path)?
-        .take(512)
-        .read_to_end(&mut head)?;
+    volume.by_ref().take(512).read_to_end(&mut head)?;
     let base = volume::base_path(path);
     let name = base
         .as_deref()
@@ -492,8 +506,27 @@ pub fn detect(path: &Path) -> Result<Format> {
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    detect_bytes(&head, &name)
-        .ok_or_else(|| Error::Unsupported(format!("unknown format: {}", path.display())))
+    if let Some(format) = detect_bytes(&head, &name) {
+        return Ok(format);
+    }
+    if head.starts_with(b"MZ")
+        && let Some((format, _)) = sfx::find(&mut volume)?
+    {
+        return Ok(format);
+    }
+    Err(Error::Unsupported(format!(
+        "unknown format: {}",
+        path.display()
+    )))
+}
+
+/// Windows executables (self-extracting archives) are read-only for us.
+fn is_exe(path: &Path) -> bool {
+    let mut head = [0; 2];
+    File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .is_ok()
+        && head == *b"MZ"
 }
 
 fn detect_bytes(head: &[u8], name: &str) -> Option<Format> {
@@ -507,6 +540,7 @@ fn detect_bytes(head: &[u8], name: &str) -> Option<Format> {
         [0xFD, b'7', b'z', b'X', b'Z', 0, ..] => pick(&[".txz"], Format::TarXz, Format::Xz),
         [b'B', b'Z', b'h', ..] => pick(&[".tbz", ".tbz2"], Format::TarBz2, Format::Bz2),
         [0x28, 0xB5, 0x2F, 0xFD, ..] => pick(&[".tzst"], Format::TarZst, Format::Zst),
+        [b'L', b'Z', b'I', b'P', ..] => pick(&[".tlz"], Format::TarLz, Format::Lz),
         _ if head.get(257..262) == Some(b"ustar") || name.ends_with(".tar") => Format::Tar,
         _ if name.ends_with(".lzma") => Format::Lzma,
         _ => return None,

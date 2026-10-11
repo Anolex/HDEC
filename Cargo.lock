@@ -1591,6 +1591,7 @@ name = "hdec-core"
 version = "0.1.0"
 dependencies = [
  "bzip2",
+ "crc32fast",
  "flate2",
  "jiff",
  "lzma-rust2 0.21.0",

@@ -19,6 +19,7 @@ ruzstd = "0.9.1"
 # never enable `zstd` (C)
 sevenz-rust2 = { version = "0.24.0", default-features = false, features = ["aes256", "bzip2", "compress", "deflate", "ppmd"] }
 tempfile = "3"
+crc32fast = "1.5"
 # read-only: never enable `write` (we don't create RAR)
 rars = { version = "0.10.0", default-features = false, features = ["encryption"] }
 eframe = "0.36.2"

@@ -900,3 +900,69 @@ fn rar_selection_and_corruption() {
     fs::write(&bad, bytes).unwrap();
     assert!(hdec_core::test(&bad, &ctx(None, &cancel)).is_err());
 }
+
+/// A fake Windows stub: "MZ", junk containing a bare 7z signature (no valid header), then the archive.
+fn fake_sfx(archive: &[u8]) -> Vec<u8> {
+    let mut exe = b"MZ".to_vec();
+    exe.extend((0..50_000u32).map(|i| (i * 7) as u8));
+    exe.extend_from_slice(b"7z\xBC\xAF\x27\x1C\x00\x04junkjunkjunkjunkjunkjunk");
+    exe.extend((0..1000u32).map(|i| (i * 13) as u8));
+    exe.extend_from_slice(archive);
+    exe
+}
+
+#[test]
+fn reads_self_extracting_exes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cancel = AtomicBool::new(false);
+    let mut cases = Vec::new();
+    for format in [Format::SevenZ, Format::Zip] {
+        let (_t, _, archive) = create(format, Level::Normal, false, None);
+        cases.push((format, fs::read(archive).unwrap()));
+    }
+    cases.push((Format::Rar, fs::read(fixture("rar5.rar")).unwrap()));
+    for (format, bytes) in cases {
+        let exe = tmp.path().join(format!("setup_{}.exe", format.extension()));
+        fs::write(&exe, fake_sfx(&bytes)).unwrap();
+        assert_eq!(hdec_core::detect(&exe).unwrap(), format);
+        assert!(!hdec_core::modifiable(&exe));
+        let out = tmp.path().join(format.extension());
+        extract(&exe, &out, None).unwrap();
+        assert_eq!(
+            fs::read(out.join("tree/a.txt")).unwrap(),
+            b"hello",
+            "{format:?}"
+        );
+        hdec_core::test(&exe, &ctx(None, &cancel)).unwrap();
+    }
+    let plain = tmp.path().join("plain.exe");
+    fs::write(&plain, b"MZ just a program").unwrap();
+    assert!(hdec_core::detect(&plain).is_err());
+}
+
+#[test]
+fn reads_lzip() {
+    use std::io::Write;
+    let tmp = tempfile::tempdir().unwrap();
+    let lz = |data: &[u8]| {
+        let mut w =
+            lzma_rust2::LzipWriter::new(Vec::new(), lzma_rust2::LzipOptions::with_preset(6));
+        w.write_all(data).unwrap();
+        w.finish().unwrap()
+    };
+    fs::write(tmp.path().join("note.txt.lz"), lz(b"hello lzip")).unwrap();
+    let (_t, _, tar) = create(Format::Tar, Level::Normal, false, None);
+    fs::write(tmp.path().join("t.tar.lz"), lz(&fs::read(tar).unwrap())).unwrap();
+
+    assert_eq!(
+        hdec_core::detect(&tmp.path().join("t.tar.lz")).unwrap(),
+        Format::TarLz
+    );
+    extract(&tmp.path().join("note.txt.lz"), &tmp.path().join("a"), None).unwrap();
+    assert_eq!(
+        fs::read(tmp.path().join("a/note.txt")).unwrap(),
+        b"hello lzip"
+    );
+    extract(&tmp.path().join("t.tar.lz"), &tmp.path().join("b"), None).unwrap();
+    assert_eq!(fs::read(tmp.path().join("b/tree/a.txt")).unwrap(), b"hello");
+}
