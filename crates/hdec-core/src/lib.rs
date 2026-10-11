@@ -1,4 +1,5 @@
 mod formats {
+    pub mod sevenz;
     pub mod stream;
     pub mod tar;
     pub mod zip;
@@ -144,8 +145,8 @@ impl Ctx<'_> {
         }
     }
 
-    /// An I/O error raised by our own cancelling reader is reported as `Cancelled`.
-    fn io_error(&self, e: io::Error) -> Error {
+    /// Errors raised through our cancelling readers are reported as `Cancelled`.
+    fn or_cancelled(&self, e: impl Into<Error>) -> Error {
         if self.cancel.load(Ordering::Relaxed) {
             Error::Cancelled
         } else {
@@ -190,6 +191,7 @@ pub struct CreateOptions {
 pub fn list(path: &Path, ctx: &Ctx) -> Result<Vec<Entry>> {
     match detect(path)? {
         Format::Zip => formats::zip::list(path, ctx),
+        Format::SevenZ => formats::sevenz::list(path, ctx),
         f @ (Format::Tar | Format::TarGz | Format::TarXz | Format::TarBz2 | Format::TarZst) => {
             formats::tar::list(path, f)
         }
@@ -218,6 +220,7 @@ fn run_extract(
 ) -> Result<Vec<String>> {
     match detect(path)? {
         Format::Zip => formats::zip::extract(path, dest, opts, ctx),
+        Format::SevenZ => formats::sevenz::extract(path, dest, opts, ctx),
         f @ (Format::Tar | Format::TarGz | Format::TarXz | Format::TarBz2 | Format::TarZst) => {
             formats::tar::extract(path, f, dest, opts, ctx)
         }
@@ -237,6 +240,7 @@ pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx)
     }
     match opts.format {
         Format::Zip => formats::zip::create(sources, dest, opts, ctx),
+        Format::SevenZ => formats::sevenz::create(sources, dest, opts, ctx),
         Format::Tar | Format::TarGz | Format::TarXz | Format::TarBz2 => {
             formats::tar::create(sources, dest, opts, ctx)
         }
@@ -265,7 +269,7 @@ fn is_selected(name: &str, only: Option<&[String]>) -> bool {
 /// Copies entry data while reporting progress and honouring cancellation.
 struct Meter<'a> {
     ctx: &'a Ctx<'a>,
-    done: u64,
+    done: Cell<u64>,
     total: u64,
     /// Streamed formats report compressed bytes consumed instead of bytes written.
     consumed: Option<&'a Cell<u64>>,
@@ -276,7 +280,7 @@ impl<'a> Meter<'a> {
     fn new(ctx: &'a Ctx<'a>, total: u64) -> Self {
         Self {
             ctx,
-            done: 0,
+            done: Cell::new(0),
             total,
             consumed: None,
             buf: vec![0; 256 << 10],
@@ -291,15 +295,15 @@ impl<'a> Meter<'a> {
         }
     }
 
-    fn advance(&mut self, n: usize, name: &str) {
-        self.done += n as u64;
-        let shown = self.consumed.map_or(self.done, Cell::get);
+    fn advance(&self, n: usize, name: &str) {
+        self.done.set(self.done.get() + n as u64);
+        let shown = self.consumed.map_or(self.done.get(), Cell::get);
         (self.ctx.progress)(shown, self.total, name);
     }
 
     /// For APIs that pull from a reader (e.g. tar::Builder). Cancellation surfaces
-    /// as an I/O error; map it back with `Ctx::io_error`.
-    fn reader<'m, R: Read>(&'m mut self, name: &'m str, inner: R) -> MeterRead<'m, 'a, R> {
+    /// as an I/O error; map it back with `Ctx::or_cancelled`.
+    fn reader<'m, R: Read>(&'m self, name: &'m str, inner: R) -> MeterRead<'m, 'a, R> {
         MeterRead {
             meter: self,
             name,
@@ -341,7 +345,7 @@ impl<'a> Meter<'a> {
 }
 
 struct MeterRead<'m, 'a, R> {
-    meter: &'m mut Meter<'a>,
+    meter: &'m Meter<'a>,
     name: &'m str,
     inner: R,
 }

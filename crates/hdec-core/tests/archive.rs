@@ -487,3 +487,107 @@ fn detects_corrupt_streams() {
         );
     }
 }
+
+#[test]
+fn sevenz_round_trips() {
+    for level in [Level::Store, Level::Fast, Level::Normal, Level::Max] {
+        let (tmp, src, archive) = create(Format::SevenZ, level, false, None);
+        let out = tmp.path().join("x");
+        assert!(extract(&archive, &out, None).unwrap().is_empty());
+        assert_eq!(snapshot(&out.join("tree")), snapshot(&src), "{level:?}");
+        let cancel = AtomicBool::new(false);
+        hdec_core::test(&archive, &ctx(None, &cancel)).unwrap();
+        let entries = hdec_core::list(&archive, &ctx(None, &cancel)).unwrap();
+        assert!(entries.iter().any(|e| e.path == "tree/empty" && e.is_dir));
+        assert!(entries.iter().all(|e| !e.encrypted));
+    }
+}
+
+#[test]
+fn sevenz_keeps_modification_time() {
+    let (tmp, _, archive) = create(Format::SevenZ, Level::Normal, false, None);
+    let out = tmp.path().join("x");
+    extract(&archive, &out, None).unwrap();
+    let got = fs::metadata(out.join("tree/a.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(
+        got,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000)
+    );
+}
+
+#[test]
+fn sevenz_passwords_encrypt_names_too() {
+    let (tmp, src, archive) = create(Format::SevenZ, Level::Normal, false, Some("pässword"));
+    let cancel = AtomicBool::new(false);
+    assert!(matches!(
+        hdec_core::list(&archive, &ctx(None, &cancel)),
+        Err(Error::PasswordRequired)
+    ));
+    assert!(matches!(
+        hdec_core::list(&archive, &ctx(Some("nope"), &cancel)),
+        Err(Error::WrongPassword)
+    ));
+    assert!(matches!(
+        extract(&archive, &tmp.path().join("x"), Some("nope")),
+        Err(Error::WrongPassword)
+    ));
+    let entries = hdec_core::list(&archive, &ctx(Some("pässword"), &cancel)).unwrap();
+    assert!(
+        entries
+            .iter()
+            .filter(|e| !e.is_dir && e.size > 0)
+            .all(|e| e.encrypted)
+    );
+    let out = tmp.path().join("y");
+    extract(&archive, &out, Some("pässword")).unwrap();
+    assert_eq!(snapshot(&out.join("tree")), snapshot(&src));
+    assert!(
+        !fs::read(&archive)
+            .unwrap()
+            .windows(5)
+            .any(|w| w == b"a.txt")
+    );
+}
+
+#[test]
+fn sevenz_extracts_selection_from_solid_block() {
+    let (tmp, _, archive) = create(Format::SevenZ, Level::Normal, false, None);
+    let cancel = AtomicBool::new(false);
+    let opts = ExtractOptions {
+        only: Some(vec!["tree/sub/deeper".into()]),
+        ..Default::default()
+    };
+    let out = tmp.path().join("x");
+    hdec_core::extract(&archive, &out, &opts, &ctx(None, &cancel)).unwrap();
+    assert_eq!(
+        fs::read(out.join("tree/sub/deeper/big.bin")).unwrap(),
+        fs::read(tmp.path().join("tree/sub/deeper/big.bin")).unwrap()
+    );
+    assert!(!out.join("tree/a.txt").exists());
+}
+
+#[test]
+fn reads_bsdtar_7z_codecs() {
+    for codec in ["lzma1", "lzma2", "bzip2", "deflate", "ppmd", "store"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = fixture(&format!("bsdtar_{codec}.7z"));
+        assert!(
+            extract(&archive, tmp.path(), None).unwrap().is_empty(),
+            "{codec}"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("tree/a.txt")).unwrap(),
+            b"hello",
+            "{codec}"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("tree/sub/b.txt")).unwrap(),
+            b"world",
+            "{codec}"
+        );
+        assert!(tmp.path().join("tree/empty").is_dir(), "{codec}");
+    }
+}

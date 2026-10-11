@@ -23,3 +23,6 @@ TAR fixtures use `tree/` plus a 120-char directory `ddd…/ünï.txt` ("long") a
 | `note.txt.{gz,xz,bz2,lzma}` | `gzip -9c` / `xz -c` / `bzip2 -c` / `lzma -c` of "hello stream" |
 | `multi_member.gz` | two gzip members: "part1 " + "part2" |
 | `multi_frame.zst` | two zstd frames: "hello stream" + " more" |
+| `bsdtar_{lzma1,lzma2,bzip2,deflate,ppmd,store}.7z` | `tar --format 7zip --options 7zip:compression=<codec> -cf … tree` (bsdtar 3.5.3) |
+
+No 7-Zip / WinRAR fixtures yet: AES 7z and all RAR fixtures need the real tools (see PLAN.md).

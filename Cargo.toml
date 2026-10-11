@@ -16,6 +16,8 @@ flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] 
 bzip2 = "0.6.1"          # default backend is libbz2-rs-sys (pure Rust)
 lzma-rust2 = "0.21"      # same version zip uses
 ruzstd = "0.9.1"
+# never enable `zstd` (C)
+sevenz-rust2 = { version = "0.24.0", default-features = false, features = ["aes256", "bzip2", "compress", "deflate", "ppmd"] }
 tempfile = "3"
 eframe = "0.36.2"
 egui_extras = "0.36.2"

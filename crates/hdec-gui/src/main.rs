@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 /// Formats offered in the Create dialog (grows as core gains writers).
 const CREATE_FORMATS: &[Format] = &[
     Format::Zip,
+    Format::SevenZ,
     Format::Tar,
     Format::TarGz,
     Format::TarXz,

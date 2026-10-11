@@ -109,7 +109,7 @@ Each phase ends with: `cargo fmt --check`, `cargo clippy --all-targets -- -D war
 | P1 ✅ | ZIP | list / extract / test / create; all read methods; AES + ZipCrypto | round-trip tests; reads fixtures from macOS `zip`, 7-Zip, Windows Explorer; Explorer/Archive Utility open our ZipCrypto output |
 | P2 ✅ | GUI MVP | browse, extract (all/selected), create ZIP, drag & drop, progress/cancel, password modal | usable for daily ZIP work on macOS + Windows |
 | P3 ✅ | TAR + streams | tar, tar.gz/xz/bz2/zst, gz/xz/bz2/zst/lzma | round-trip + fixtures from bsdtar/GNU tar (incl. long names, pax headers, symlinks) |
-| P4 | 7Z | list / extract / create, AES, header encryption, solid | 7-Zip opens our output; we open 7-Zip's (LZMA, LZMA2, BCJ, PPMd if crate supports, encrypted) |
+| P4 ✅ | 7Z | list / extract / create, AES, header encryption, solid | 7-Zip opens our output; we open 7-Zip's (LZMA, LZMA2, BCJ, PPMd if crate supports, encrypted) |
 | P5 | Volumes + modify | split write, `.001` / spanned-ZIP read, add/delete/rename | split → join → identical; modify keeps untouched ZIP entries byte-identical |
 | P6 | RAR5 | list / extract / test, encryption, multi-volume, `fuzz/` harness | all RAR5 fixtures decode with matching CRC; 1 h fuzz run clean |
 | P7 | RAR3/4 | LZ + PPMd var.H + RarVM standard filters, AES-128, old volumes | RAR 2.9–4.x fixtures decode; fuzz clean |
@@ -146,6 +146,7 @@ Each phase ends with: `cargo fmt --check`, `cargo clippy --all-targets -- -D war
 | Notarization / Authenticode need paid certs | needed only at P9 |
 
 ## 8. Decisions log
+- 2026-10-11: 7Z: solid blocks of 256 MiB, file names always encrypted when a password is set, unix modes/symlinks stored p7zip-style (attribute 0x8000 + st_mode<<16). Interop verified against bsdtar (libarchive) both ways; AES interop with real 7-Zip still to do.
 - 2026-10-11: Streamed formats (tar.*, gz/xz/bz2/zst/lzma) report progress as compressed bytes read; LZMA/XZ dictionaries over 2 GiB are refused. Hard links in tar are only created to targets inside the destination.
 - 2026-10-11: Unsafe entries (traversal, escaping symlinks) are skipped and returned as warnings, not fatal. Overwrite policy is chosen up front (no mid-extraction "ask").
 - 2026-10-11: ZIP times are written as local wall-clock (DOS) via `jiff`'s system tz.

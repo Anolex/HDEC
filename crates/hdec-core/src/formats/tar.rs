@@ -148,7 +148,7 @@ fn extract_entry(
 
 pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx) -> Result<()> {
     let items = hfs::walk(sources)?;
-    let mut meter = Meter::new(
+    let meter = Meter::new(
         ctx,
         items
             .iter()
@@ -172,7 +172,7 @@ pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx)
             let file = File::open(&item.path)?;
             builder
                 .append_data(&mut header, &item.name, meter.reader(&item.name, file))
-                .map_err(|e| ctx.io_error(e))?;
+                .map_err(|e| ctx.or_cancelled(e))?;
         }
     }
     let out = builder
