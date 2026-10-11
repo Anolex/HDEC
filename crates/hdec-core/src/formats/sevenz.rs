@@ -1,6 +1,7 @@
 //! 7z via sevenz-rust2.
 
 use crate::fs::{self as hfs, OutFile, Source};
+use crate::volume::Volume;
 use crate::{CreateOptions, Ctx, Entry, Error, ExtractOptions, Level, Meter, Result, safe_path};
 use sevenz_rust2::encoder_options::{AesEncoderOptions, Lzma2Options};
 use sevenz_rust2::{
@@ -8,7 +9,7 @@ use sevenz_rust2::{
     NtTime, Password, SourceReader,
 };
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Read};
+use std::io::{self, BufReader, BufWriter, Read};
 use std::path::{Path, PathBuf};
 
 /// p7zip / 7-Zip convention: this attribute bit means the high 16 bits hold `st_mode`.
@@ -50,9 +51,10 @@ fn password_hint(e: Error, ctx: &Ctx) -> Error {
     }
 }
 
-fn open(path: &Path, ctx: &Ctx) -> Result<ArchiveReader<File>> {
+fn open(path: &Path, ctx: &Ctx) -> Result<ArchiveReader<BufReader<Volume>>> {
     let password = ctx.password.map_or_else(Password::empty, Password::new);
-    ArchiveReader::open(path, password).map_err(|e| password_hint(e.into(), ctx))
+    ArchiveReader::new(BufReader::new(Volume::open(path)?), password)
+        .map_err(|e| password_hint(e.into(), ctx))
 }
 
 fn name(f: &ArchiveEntry) -> String {

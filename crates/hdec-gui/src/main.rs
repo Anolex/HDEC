@@ -1,6 +1,6 @@
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
-use hdec_core::{CreateOptions, Ctx, Entry, Error, ExtractOptions, Format, Level, Overwrite};
+use hdec_core::{CreateOptions, Ctx, Edit, Entry, Error, ExtractOptions, Format, Level, Overwrite};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +49,7 @@ enum Action {
     Open(PathBuf),
     Extract(PathBuf, ExtractOptions),
     Test,
+    Modify(Edit),
 }
 
 enum Outcome {
@@ -56,6 +57,7 @@ enum Outcome {
     Extracted(PathBuf, Vec<String>),
     Tested,
     Created(PathBuf),
+    Modified,
 }
 
 enum Msg {
@@ -77,6 +79,11 @@ enum Dialog {
     #[default]
     None,
     Message(String),
+    ConfirmDelete(Vec<String>),
+    Rename {
+        from: String,
+        name: String,
+    },
     Password {
         input: Zeroizing<String>,
         then: Action,
@@ -98,6 +105,8 @@ struct CreateForm {
     zip_crypto: bool,
     password: Zeroizing<String>,
     confirm: Zeroizing<String>,
+    split: bool,
+    split_mb: String,
 }
 
 #[derive(Default)]
@@ -108,6 +117,7 @@ struct App {
     cwd: String,
     rows: Vec<Entry>,
     selected: BTreeSet<String>,
+    modifiable: bool,
     /// Password that worked for the open archive.
     password: Password,
     job: Option<Job>,
@@ -130,6 +140,9 @@ impl App {
             }
             Action::Test => {
                 hdec_core::test(archive.as_deref().unwrap(), c).map(|_| Outcome::Tested)
+            }
+            Action::Modify(edit) => {
+                hdec_core::modify(archive.as_deref().unwrap(), &edit, c).map(|_| Outcome::Modified)
             }
         });
     }
@@ -205,9 +218,16 @@ impl App {
                 self.status = format!("{} — {format}, {} entries", path.display(), entries.len());
                 let title = path.file_name().unwrap_or_default().to_string_lossy();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{title} — HDEC")));
+                let reopened = self.archive.as_ref() == Some(&path);
+                self.modifiable = hdec_core::modifiable(&path);
                 self.archive = Some(path);
                 self.entries = entries;
-                self.navigate(String::new());
+                let keep = reopened && self.entries.iter().any(|e| e.path == self.cwd);
+                self.navigate(if keep {
+                    self.cwd.clone()
+                } else {
+                    String::new()
+                });
             }
             Outcome::Extracted(dest, warnings) => {
                 self.status = format!("Extracted to {}", dest.display());
@@ -220,6 +240,10 @@ impl App {
             }
             Outcome::Tested => self.dialog = Dialog::Message("No errors found.".into()),
             Outcome::Created(path) => self.open(ctx, path),
+            Outcome::Modified => {
+                let path = self.archive.clone().unwrap();
+                self.run(ctx, Action::Open(path), self.password.clone());
+            }
         }
     }
 
@@ -257,6 +281,8 @@ impl App {
             zip_crypto: false,
             password: Default::default(),
             confirm: Default::default(),
+            split: false,
+            split_mb: "100".into(),
         });
     }
 
@@ -266,6 +292,11 @@ impl App {
             format: form.format,
             level: form.level,
             zip_crypto: form.zip_crypto,
+            split: form
+                .split
+                .then(|| form.split_mb.trim().parse::<f64>().ok())
+                .flatten()
+                .map(|mb| (mb * 1024.0 * 1024.0) as u64),
         };
         let password =
             (form.format.encryptable() && !form.password.is_empty()).then(|| form.password.clone());
@@ -314,8 +345,46 @@ impl App {
                 {
                     self.run(ui.ctx(), Action::Test, self.password.clone());
                 }
+                ui.separator();
+                ui.add_enabled_ui(self.modifiable, |ui| self.edit_buttons(ui));
             });
         });
+    }
+
+    fn edit_buttons(&mut self, ui: &mut egui::Ui) {
+        if ui.button("Add files…").clicked()
+            && let Some(files) = rfd::FileDialog::new().pick_files()
+        {
+            self.add(ui.ctx(), files);
+        }
+        if ui.button("Add folder…").clicked()
+            && let Some(dir) = rfd::FileDialog::new().pick_folder()
+        {
+            self.add(ui.ctx(), vec![dir]);
+        }
+        let selected: Vec<String> = self.selected.iter().cloned().collect();
+        if ui
+            .add_enabled(!selected.is_empty(), egui::Button::new("Delete"))
+            .clicked()
+        {
+            self.dialog = Dialog::ConfirmDelete(selected.clone());
+        }
+        if ui
+            .add_enabled(selected.len() == 1, egui::Button::new("Rename…"))
+            .clicked()
+        {
+            let from = selected[0].clone();
+            let name = from.rsplit('/').next().unwrap_or(&from).to_owned();
+            self.dialog = Dialog::Rename { from, name };
+        }
+    }
+
+    fn add(&mut self, ctx: &egui::Context, sources: Vec<PathBuf>) {
+        let edit = Edit::Add {
+            sources,
+            into: self.cwd.clone(),
+        };
+        self.run(ctx, Action::Modify(edit), self.password.clone());
     }
 
     fn breadcrumb(&mut self, ui: &mut egui::Ui) {
@@ -447,6 +516,68 @@ impl App {
                     Dialog::None
                 }
             }
+            Dialog::ConfirmDelete(names) => {
+                let mut result = None;
+                modal(ctx, |ui| {
+                    ui.label(format!("Delete {} item(s) from the archive?", names.len()));
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            result = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            result = Some(false);
+                        }
+                    });
+                });
+                match result {
+                    Some(true) => {
+                        self.run(
+                            ctx,
+                            Action::Modify(Edit::Delete(names)),
+                            self.password.clone(),
+                        );
+                        Dialog::None
+                    }
+                    Some(false) => Dialog::None,
+                    None => Dialog::ConfirmDelete(names),
+                }
+            }
+            Dialog::Rename { from, mut name } => {
+                let mut result = None;
+                modal(ctx, |ui| {
+                    ui.heading("Rename");
+                    let field = ui.text_edit_singleline(&mut name);
+                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let valid =
+                        !name.is_empty() && !name.contains('/') && name != "." && name != "..";
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(valid, egui::Button::new("Rename")).clicked()
+                            || (enter && valid)
+                        {
+                            result = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            result = Some(false);
+                        }
+                    });
+                });
+                match result {
+                    Some(true) => {
+                        let to = match from.rsplit_once('/') {
+                            Some((parent, _)) => format!("{parent}/{name}"),
+                            None => name,
+                        };
+                        self.run(
+                            ctx,
+                            Action::Modify(Edit::Rename { from, to }),
+                            self.password.clone(),
+                        );
+                        Dialog::None
+                    }
+                    Some(false) => Dialog::None,
+                    None => Dialog::Rename { from, name },
+                }
+            }
             Dialog::Password {
                 mut input,
                 then,
@@ -571,6 +702,7 @@ impl eframe::App for App {
                 [one] if one.is_file() && hdec_core::detect(one).is_ok() => {
                     self.open(&ctx, one.clone())
                 }
+                _ if self.modifiable => self.add(&ctx, dropped),
                 _ => self.new_archive(dropped),
             }
         }
@@ -649,9 +781,31 @@ fn create_form(ui: &mut egui::Ui, form: &mut CreateForm, result: &mut Option<boo
         }
     }
     ui.horizontal(|ui| {
+        ui.checkbox(&mut form.split, "Split into volumes of");
+        ui.add_enabled(
+            form.split,
+            egui::TextEdit::singleline(&mut form.split_mb).desired_width(60.0),
+        );
+        ui.label("MB");
+        for (label, mb) in [("CD", "700"), ("FAT32", "4095")] {
+            if ui
+                .add_enabled(form.split, egui::Button::new(label).small())
+                .clicked()
+            {
+                form.split_mb = mb.into();
+            }
+        }
+    });
+    let bad_split = form.split
+        && !form
+            .split_mb
+            .trim()
+            .parse::<f64>()
+            .is_ok_and(|mb| mb >= 0.01);
+    ui.horizontal(|ui| {
         if ui
             .add_enabled(
-                !mismatch && !form.dest.is_empty(),
+                !mismatch && !bad_split && !form.dest.is_empty(),
                 egui::Button::new("Create"),
             )
             .clicked()

@@ -2,6 +2,7 @@
 
 use super::stream::{Encoder, decoder};
 use crate::fs::{self as hfs, OutFile};
+use crate::volume::Volume;
 use crate::{
     CountingRead, CreateOptions, Ctx, Entry, ExtractOptions, Format, Meter, Result, safe_path,
 };
@@ -29,7 +30,7 @@ fn mtime(header: &tar::Header) -> Option<SystemTime> {
 }
 
 pub fn list(path: &Path, format: Format) -> Result<Vec<Entry>> {
-    let mut archive = tar::Archive::new(decoder(format, BufReader::new(File::open(path)?))?);
+    let mut archive = tar::Archive::new(decoder(format, BufReader::new(Volume::open(path)?))?);
     let mut out = Vec::new();
     for entry in archive.entries()? {
         let entry = entry?;
@@ -65,9 +66,9 @@ pub fn extract(
     opts: &ExtractOptions,
     ctx: &Ctx,
 ) -> Result<Vec<String>> {
-    let file = File::open(path)?;
+    let file = Volume::open(path)?;
     let consumed = Cell::new(0);
-    let mut meter = Meter::streamed(ctx, file.metadata()?.len(), &consumed);
+    let mut meter = Meter::streamed(ctx, file.len(), &consumed);
     let input = BufReader::new(CountingRead {
         inner: file,
         count: &consumed,

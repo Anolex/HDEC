@@ -1,6 +1,10 @@
 use crate::fs::{self as hfs, OutFile};
-use crate::{CreateOptions, Ctx, Entry, Error, ExtractOptions, Level, Meter, Result, safe_path};
+use crate::volume::Volume;
+use crate::{
+    CreateOptions, Ctx, Edit, Entry, Error, ExtractOptions, Level, Meter, Result, safe_path,
+};
 use jiff::tz::TimeZone;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -10,7 +14,7 @@ use zip::unstable::write::FileOptionsExt;
 use zip::write::SimpleFileOptions;
 use zip::{AesMode, CompressionMethod, ZipArchive, ZipWriter};
 
-type Archive = ZipArchive<BufReader<File>>;
+type Archive = ZipArchive<BufReader<Volume>>;
 
 impl From<ZipError> for Error {
     fn from(e: ZipError) -> Self {
@@ -28,7 +32,7 @@ impl From<ZipError> for Error {
 }
 
 fn open(path: &Path) -> Result<Archive> {
-    Ok(ZipArchive::new(BufReader::new(File::open(path)?))?)
+    Ok(ZipArchive::new(BufReader::new(Volume::open(path)?))?)
 }
 
 pub fn list(path: &Path, _ctx: &Ctx) -> Result<Vec<Entry>> {
@@ -167,8 +171,28 @@ fn read_entry(
     }
 }
 
+type Writer = ZipWriter<BufWriter<OutFile>>;
+
 pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx) -> Result<()> {
     let items = hfs::walk(sources)?;
+    let mut w = ZipWriter::new(BufWriter::new(OutFile::create(dest.to_path_buf())?));
+    add_items(&mut w, &items, "", opts, ctx)?;
+    finish(w)
+}
+
+fn finish(w: Writer) -> Result<()> {
+    let out = w.finish()?.into_inner().map_err(|e| e.into_error())?;
+    out.file().sync_all()?;
+    out.commit()
+}
+
+fn add_items(
+    w: &mut Writer,
+    items: &[hfs::Source],
+    prefix: &str,
+    opts: &CreateOptions,
+    ctx: &Ctx,
+) -> Result<()> {
     let mut meter = Meter::new(
         ctx,
         items
@@ -177,7 +201,6 @@ pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx)
             .map(|s| s.meta.len())
             .sum(),
     );
-    let mut zip = ZipWriter::new(BufWriter::new(OutFile::create(dest.to_path_buf())?));
     let base = match opts.level {
         Level::Store => SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
         level => SimpleFileOptions::default()
@@ -188,8 +211,9 @@ pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx)
                 _ => 9,
             })),
     };
-    for item in &items {
+    for item in items {
         ctx.check()?;
+        let name = format!("{prefix}{}", item.name);
         let mut o = base.last_modified_time(
             item.meta
                 .modified()
@@ -208,18 +232,56 @@ pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx)
             };
         }
         if item.meta.is_dir() {
-            zip.add_directory(&item.name, o)?;
+            w.add_directory(&name, o)?;
         } else if item.meta.is_symlink() {
             let target = std::fs::read_link(&item.path)?;
-            zip.add_symlink(&item.name, target.to_string_lossy(), o)?;
+            w.add_symlink(&name, target.to_string_lossy(), o)?;
         } else {
-            zip.start_file(&item.name, o.large_file(item.meta.len() >= u32::MAX as u64))?;
-            meter.copy(&item.name, &mut File::open(&item.path)?, &mut zip)?;
+            w.start_file(&name, o.large_file(item.meta.len() >= u32::MAX as u64))?;
+            meter.copy(&name, &mut File::open(&item.path)?, w)?;
         }
     }
-    let out = zip.finish()?.into_inner().map_err(|e| e.into_error())?;
-    out.file().sync_all()?;
-    out.commit()
+    Ok(())
+}
+
+/// Copies unchanged entries raw (no recompression, encryption kept), then adds new ones.
+pub fn modify(path: &Path, edit: &Edit, ctx: &Ctx) -> Result<()> {
+    let mut src = open(path)?;
+    let mut w = ZipWriter::new(BufWriter::new(OutFile::create(path.to_path_buf())?));
+    let (added, prefix) = match edit {
+        Edit::Add { sources, into } if into.is_empty() => (hfs::walk(sources)?, String::new()),
+        Edit::Add { sources, into } => (hfs::walk(sources)?, format!("{into}/")),
+        _ => (Vec::new(), String::new()),
+    };
+    let replaced: HashSet<String> = added
+        .iter()
+        .map(|s| format!("{prefix}{}", s.name))
+        .collect();
+    for i in 0..src.len() {
+        ctx.check()?;
+        let name = src.by_index_data(i)?.name()?.replace('\\', "/");
+        let bare = name.trim_end_matches('/');
+        let new_name = match edit {
+            Edit::Delete(names) if crate::is_selected(bare, Some(names)) => continue,
+            Edit::Add { .. } if replaced.contains(bare) => continue,
+            Edit::Rename { from, to } => renamed(&name, from, to),
+            _ => None,
+        };
+        let f = src.by_index_raw(i)?;
+        match new_name {
+            Some(n) => w.raw_copy_file_rename(f, n)?,
+            None => w.raw_copy_file(f)?,
+        }
+    }
+    add_items(&mut w, &added, &prefix, &CreateOptions::default(), ctx)?;
+    drop(src); // Windows can't replace a file that is still open
+    finish(w)
+}
+
+/// `renamed("a/b/c", "a/b", "x")` → `Some("x/c")`.
+fn renamed(name: &str, from: &str, to: &str) -> Option<String> {
+    let rest = name.strip_prefix(from)?;
+    (rest.is_empty() || rest.starts_with('/')).then(|| format!("{to}{rest}"))
 }
 
 /// ZIP stores local wall-clock time without a zone.

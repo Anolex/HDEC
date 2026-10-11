@@ -6,10 +6,10 @@ mod formats {
 }
 mod fs;
 pub mod safe_path;
+mod volume;
 
 use std::cell::Cell;
 use std::fmt;
-use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,8 +57,9 @@ impl From<io::Error> for Error {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Format {
+    #[default]
     Zip,
     SevenZ,
     Rar,
@@ -179,13 +180,26 @@ pub enum Level {
     Max,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CreateOptions {
     pub format: Format,
     pub level: Level,
     /// ZIP only: legacy ZipCrypto instead of AES-256. Weak, but the only
     /// encryption Windows Explorer and macOS Archive Utility can open.
     pub zip_crypto: bool,
+    /// Split the finished archive into `dest.001`, `dest.002`, … of this many bytes.
+    pub split: Option<u64>,
+}
+
+/// One change to an existing archive.
+#[derive(Debug, Clone)]
+pub enum Edit {
+    /// Add files/folders into archive folder `into` ("" = root), replacing same-named entries.
+    Add { sources: Vec<PathBuf>, into: String },
+    /// Remove entries; a folder removes everything below it.
+    Delete(Vec<String>),
+    /// Rename or move one entry or folder; `to` is the full new path.
+    Rename { from: String, to: String },
 }
 
 pub fn list(path: &Path, ctx: &Ctx) -> Result<Vec<Entry>> {
@@ -249,7 +263,94 @@ pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx)
             "creating {} is not supported",
             f.name()
         ))),
+    }?;
+    match opts.split {
+        Some(size) => volume::split(dest, size, ctx),
+        None => Ok(()),
     }
+}
+
+/// True if `path` can be changed with [`modify`].
+pub fn modifiable(path: &Path) -> bool {
+    volume::base_path(path).is_none()
+        && matches!(
+            detect(path),
+            Ok(Format::Zip
+                | Format::SevenZ
+                | Format::Tar
+                | Format::TarGz
+                | Format::TarXz
+                | Format::TarBz2)
+        )
+}
+
+/// Applies `edit`, replacing the archive only once the new one is complete.
+pub fn modify(path: &Path, edit: &Edit, ctx: &Ctx) -> Result<()> {
+    if !modifiable(path) {
+        return Err(Error::Unsupported(format!(
+            "{} can't be modified",
+            path.display()
+        )));
+    }
+    match detect(path)? {
+        Format::Zip => formats::zip::modify(path, edit, ctx),
+        format => rewrite(path, format, edit, ctx),
+    }
+}
+
+/// Generic modify: extract next to the archive, edit the files, re-create.
+/// ponytail: recompresses everything at Normal level; ZIP has a raw-copy path instead.
+fn rewrite(path: &Path, format: Format, edit: &Edit, ctx: &Ctx) -> Result<()> {
+    let scratch = tempfile::Builder::new()
+        .prefix(".hdec-edit")
+        .tempdir_in(path.parent().unwrap_or(Path::new(".")))?;
+    let root = scratch.path();
+    let warnings = extract(path, root, &ExtractOptions::default(), ctx)?;
+    if let Some(w) = warnings.first() {
+        return Err(Error::Unsupported(format!(
+            "refusing to modify, an entry can't be extracted safely: {w}"
+        )));
+    }
+    match edit {
+        Edit::Add { sources, into } => {
+            let dir = if into.is_empty() {
+                root.to_path_buf()
+            } else {
+                safe_path::join(root, into)?
+            };
+            fs::make_dirs(root, &dir)?;
+            for src in sources {
+                let name = src
+                    .file_name()
+                    .ok_or_else(|| Error::Unsupported(format!("bad source: {}", src.display())))?;
+                fs::copy_tree(src, &dir.join(name))?;
+            }
+        }
+        Edit::Delete(names) => {
+            for name in names {
+                let p = safe_path::join(root, name)?;
+                match std::fs::symlink_metadata(&p) {
+                    Ok(m) if m.is_dir() => std::fs::remove_dir_all(&p)?,
+                    Ok(_) => std::fs::remove_file(&p)?,
+                    Err(_) => {}
+                }
+            }
+        }
+        Edit::Rename { from, to } => {
+            let (from, to) = (safe_path::join(root, from)?, safe_path::join(root, to)?);
+            fs::make_dirs(root, to.parent().unwrap_or(root))?;
+            std::fs::rename(from, to)?;
+        }
+    }
+    let mut sources = std::fs::read_dir(root)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<io::Result<Vec<_>>>()?;
+    sources.sort();
+    let opts = CreateOptions {
+        format,
+        ..Default::default()
+    };
+    create(&sources, path, &opts, ctx)
 }
 
 fn unsupported(f: Format) -> Error {
@@ -379,8 +480,13 @@ impl<R: Read> Read for CountingRead<'_, R> {
 /// for compressed streams and covers formats without magic (v7 tar, .lzma).
 pub fn detect(path: &Path) -> Result<Format> {
     let mut head = Vec::with_capacity(512);
-    File::open(path)?.take(512).read_to_end(&mut head)?;
-    let name = path
+    volume::Volume::open(path)?
+        .take(512)
+        .read_to_end(&mut head)?;
+    let base = volume::base_path(path);
+    let name = base
+        .as_deref()
+        .unwrap_or(path)
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();

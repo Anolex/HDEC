@@ -176,6 +176,32 @@ fn walk_into(path: PathBuf, name: String, out: &mut Vec<Source>) -> Result<()> {
     Ok(())
 }
 
+/// Copies a file or directory tree, keeping symlinks as symlinks (skipped on
+/// Windows) and modification times.
+pub(crate) fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(src)?;
+    if meta.is_dir() {
+        fs::create_dir_all(dst)?;
+        for e in fs::read_dir(src)? {
+            let e = e?;
+            copy_tree(&e.path(), &dst.join(e.file_name()))?;
+        }
+    } else if meta.is_symlink() {
+        if fs::symlink_metadata(dst).is_ok() {
+            fs::remove_file(dst)?;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(fs::read_link(src)?, dst)?;
+    } else {
+        fs::copy(src, dst)?;
+        File::options()
+            .write(true)
+            .open(dst)?
+            .set_modified(meta.modified()?)?;
+    }
+    Ok(())
+}
+
 /// Unix permission bits of a source file, if the platform has them.
 pub(crate) fn mode(meta: &Metadata) -> Option<u32> {
     #[cfg(unix)]

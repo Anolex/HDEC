@@ -86,6 +86,7 @@ fn create(
         format,
         level,
         zip_crypto,
+        split: None,
     };
     hdec_core::create(
         std::slice::from_ref(&src),
@@ -284,6 +285,7 @@ fn cancel_leaves_nothing_behind() {
         format: Format::Zip,
         level: Level::Normal,
         zip_crypto: false,
+        split: None,
     };
     let r = hdec_core::create(&[src], &archive, &opts, &ctx(None, &cancel));
     assert!(matches!(r, Err(Error::Cancelled)));
@@ -425,6 +427,7 @@ fn stream_round_trips_single_file() {
             format,
             level: Level::Normal,
             zip_crypto: false,
+            split: None,
         };
         hdec_core::create(
             std::slice::from_ref(&src),
@@ -456,6 +459,7 @@ fn refuses_password_for_unencryptable_formats() {
         format: Format::TarGz,
         level: Level::Normal,
         zip_crypto: false,
+        split: None,
     };
     let r = hdec_core::create(
         &[src],
@@ -590,4 +594,166 @@ fn reads_bsdtar_7z_codecs() {
         );
         assert!(tmp.path().join("tree/empty").is_dir(), "{codec}");
     }
+}
+
+#[test]
+fn split_volumes_round_trip() {
+    for format in [Format::Zip, Format::SevenZ, Format::TarGz] {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = sample_tree(tmp.path());
+        let archive = tmp.path().join(format!("out.{}", format.extension()));
+        let cancel = AtomicBool::new(false);
+        let opts = CreateOptions {
+            format,
+            level: Level::Store,
+            split: Some(1_000_000),
+            ..Default::default()
+        };
+        hdec_core::create(
+            std::slice::from_ref(&src),
+            &archive,
+            &opts,
+            &ctx(None, &cancel),
+        )
+        .unwrap();
+        assert!(!archive.exists());
+        let part = |n: u32| {
+            tmp.path()
+                .join(format!("out.{}.{n:03}", format.extension()))
+        };
+        assert!(part(3).exists() && part(4).exists(), "{format:?}");
+        assert!(fs::metadata(part(1)).unwrap().len() == 1_000_000);
+        // Any part opens the whole set.
+        let out = tmp.path().join("x");
+        extract(&part(2), &out, None).unwrap();
+        assert_eq!(snapshot(&out.join("tree")), snapshot(&src), "{format:?}");
+        assert!(!hdec_core::modifiable(&part(1)));
+    }
+}
+
+#[test]
+fn modify_add_delete_rename() {
+    for format in [Format::Zip, Format::SevenZ, Format::Tar, Format::TarXz] {
+        let (tmp, _, archive) = create(format, Level::Normal, false, None);
+        assert!(hdec_core::modifiable(&archive));
+        let cancel = AtomicBool::new(false);
+        let c = ctx(None, &cancel);
+        let new = tmp.path().join("new.txt");
+        fs::write(&new, "new").unwrap();
+        let names = || -> Vec<String> {
+            hdec_core::list(&archive, &c)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.path)
+                .collect()
+        };
+
+        hdec_core::modify(
+            &archive,
+            &hdec_core::Edit::Add {
+                sources: vec![new.clone()],
+                into: "tree/sub".into(),
+            },
+            &c,
+        )
+        .unwrap();
+        assert!(
+            names().contains(&"tree/sub/new.txt".to_string()),
+            "{format:?}"
+        );
+        fs::write(&new, "newer").unwrap();
+        hdec_core::modify(
+            &archive,
+            &hdec_core::Edit::Add {
+                sources: vec![new.clone()],
+                into: "tree/sub".into(),
+            },
+            &c,
+        )
+        .unwrap();
+        assert_eq!(
+            names().iter().filter(|n| n.ends_with("new.txt")).count(),
+            1,
+            "{format:?}"
+        );
+
+        hdec_core::modify(
+            &archive,
+            &hdec_core::Edit::Delete(vec!["tree/sub/deeper".into(), "tree/a.txt".into()]),
+            &c,
+        )
+        .unwrap();
+        let after = names();
+        assert!(
+            !after
+                .iter()
+                .any(|n| n.starts_with("tree/sub/deeper") || n == "tree/a.txt"),
+            "{format:?} {after:?}"
+        );
+
+        hdec_core::modify(
+            &archive,
+            &hdec_core::Edit::Rename {
+                from: "tree/sub".into(),
+                to: "tree/moved".into(),
+            },
+            &c,
+        )
+        .unwrap();
+        let out = tmp.path().join("x");
+        extract(&archive, &out, None).unwrap();
+        assert_eq!(
+            fs::read(out.join("tree/moved/new.txt")).unwrap(),
+            b"newer",
+            "{format:?}"
+        );
+        assert_eq!(
+            fs::read(out.join("tree/moved/ünïcødé ñame.txt")).unwrap(),
+            b"unicode",
+            "{format:?}"
+        );
+        assert!(!out.join("tree/sub").exists());
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("hdec"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+}
+
+#[test]
+fn zip_modify_keeps_encrypted_entries_raw() {
+    let (tmp, _, archive) = create(Format::Zip, Level::Normal, false, Some("pw"));
+    let cancel = AtomicBool::new(false);
+    // No password needed to delete: entries are copied without decrypting.
+    hdec_core::modify(
+        &archive,
+        &hdec_core::Edit::Delete(vec!["tree/zero.bin".into()]),
+        &ctx(None, &cancel),
+    )
+    .unwrap();
+    let out = tmp.path().join("x");
+    extract(&archive, &out, Some("pw")).unwrap();
+    assert_eq!(fs::read(out.join("tree/a.txt")).unwrap(), b"hello");
+    assert!(!out.join("tree/zero.bin").exists());
+}
+
+#[test]
+fn sevenz_modify_keeps_password() {
+    let (tmp, _, archive) = create(Format::SevenZ, Level::Normal, false, Some("pw"));
+    let cancel = AtomicBool::new(false);
+    hdec_core::modify(
+        &archive,
+        &hdec_core::Edit::Delete(vec!["tree/zero.bin".into()]),
+        &ctx(Some("pw"), &cancel),
+    )
+    .unwrap();
+    assert!(matches!(
+        hdec_core::list(&archive, &ctx(None, &cancel)),
+        Err(Error::PasswordRequired)
+    ));
+    let out = tmp.path().join("x");
+    extract(&archive, &out, Some("pw")).unwrap();
+    assert!(out.join("tree/a.txt").exists() && !out.join("tree/zero.bin").exists());
 }

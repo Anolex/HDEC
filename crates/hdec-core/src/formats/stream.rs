@@ -1,6 +1,7 @@
 //! Compression filters (gz, bz2, xz, zst, lzma) and single-file compressed streams.
 
 use crate::fs::{self as hfs, OutFile};
+use crate::volume::Volume;
 use crate::{
     CountingRead, CreateOptions, Ctx, Entry, Error, ExtractOptions, Format, Level, Meter, Result,
 };
@@ -136,7 +137,13 @@ impl<R: BufRead> Read for ZstReader<R> {
 
 /// `notes.txt.gz` → `notes.txt`; no matching extension → `<name>.out`.
 fn inner_name(path: &Path, format: Format) -> String {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let base = crate::volume::base_path(path);
+    let name = base
+        .as_deref()
+        .unwrap_or(path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
     let ext = format!(".{}", format.extension());
     match name.len().checked_sub(ext.len()) {
         Some(cut) if cut > 0 && name[cut..].eq_ignore_ascii_case(&ext) => name[..cut].to_owned(),
@@ -146,10 +153,11 @@ fn inner_name(path: &Path, format: Format) -> String {
 
 pub fn list(path: &Path, format: Format) -> Result<Vec<Entry>> {
     let meta = fs::metadata(path)?;
+    let packed = Volume::open(path)?.len();
     Ok(vec![Entry {
         path: inner_name(path, format),
         size: 0, // ponytail: unknown without decoding; gz/xz trailers could provide it
-        packed: Some(meta.len()),
+        packed: Some(packed),
         modified: meta.modified().ok(),
         is_dir: false,
         encrypted: false,
@@ -164,9 +172,9 @@ pub fn extract(
     ctx: &Ctx,
 ) -> Result<Vec<String>> {
     let name = inner_name(path, format);
-    let file = File::open(path)?;
+    let file = Volume::open(path)?;
     let consumed = Cell::new(0);
-    let mut meter = Meter::streamed(ctx, file.metadata()?.len(), &consumed);
+    let mut meter = Meter::streamed(ctx, file.len(), &consumed);
     let mut r = decoder(
         format,
         BufReader::new(CountingRead {
