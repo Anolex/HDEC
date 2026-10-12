@@ -20,6 +20,25 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - name: Build the Windows app
+        if: runner.os == 'Windows'
+        run: cargo build --release -p hdec-gui
+      - name: Build the macOS app
+        if: runner.os == 'macOS'
+        # Zipped with ditto: artifact uploads drop the executable bit.
+        run: |
+          packaging/macos/bundle.sh
+          ditto -c -k --keepParent target/release/HDEC.app target/release/HDEC-macos.zip
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: hdec-windows
+          path: target/release/hdec.exe
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: hdec-macos
+          path: target/release/HDEC-macos.zip
       - name: No C/C++ in the dependency tree
         shell: bash
         run: |
