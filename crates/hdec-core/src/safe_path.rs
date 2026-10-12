@@ -79,10 +79,14 @@ fn sanitize_windows(c: &str) -> String {
         .unwrap_or("")
         .trim_end()
         .to_ascii_uppercase();
-    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+    let reserved = matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ["COM", "LPT"].iter().any(|p| {
+        stem.strip_prefix(p).is_some_and(|n| {
+            matches!(n, "¹" | "²" | "³") || (n.len() == 1 && n.as_bytes()[0].is_ascii_digit())
+        })
+    });
     if s.is_empty() || reserved {
         s.insert(0, '_');
     }
@@ -142,10 +146,13 @@ mod tests {
             Path::new("/dest/file.txt_stream")
         );
         assert_eq!(ok("a/CON.txt", true), Path::new("/dest/a/_CON.txt"));
+        for name in ["com0", "LPT9.log", "COM¹", "conout$", "CONIN$.txt"] {
+            assert_eq!(ok(name, true), Path::new("/dest").join(format!("_{name}")));
+        }
+        assert_eq!(ok("COM10", true), Path::new("/dest/COM10"));
         assert_eq!(ok("nul", true), Path::new("/dest/_nul"));
         assert_eq!(ok("com1", true), Path::new("/dest/_com1"));
         assert_eq!(ok("con .txt", true), Path::new("/dest/_con .txt"));
-        assert_eq!(ok("com0", true), Path::new("/dest/com0"));
         assert_eq!(ok("console", true), Path::new("/dest/console"));
         assert_eq!(ok("x. . ", true), Path::new("/dest/x"));
         assert_eq!(ok(".. ", true), Path::new("/dest/_"));

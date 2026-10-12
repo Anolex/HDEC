@@ -41,7 +41,10 @@ const WINDOW: [f32; 2] = [728.0, 448.0];
 
 fn main() -> eframe::Result {
     let mut app = App::default();
-    let path = std::env::args_os().nth(1).map(PathBuf::from);
+    // Absolute, so the archive's folder (Extract's default) isn't "".
+    let path = std::env::args_os()
+        .nth(1)
+        .map(|p| std::path::absolute(&p).unwrap_or_else(|_| p.into()));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(WINDOW)
@@ -726,7 +729,8 @@ impl App {
             Command::Move(paths, into) if self.modifiable => {
                 let pairs: Vec<(String, String)> = paths
                     .into_iter()
-                    .filter(|p| parent_of(p) != into)
+                    // Already there, or a folder dropped back onto itself.
+                    .filter(|p| parent_of(p) != into && *p != into)
                     .map(|p| {
                         let to = join_path(&into, base_name(&p));
                         (p, to)
@@ -2620,6 +2624,13 @@ mod tests {
         pump(&mut app, &ctx);
         assert!(matches!(app.dialog, Dialog::Error(_)));
         assert!(has(&app, "tree/fresh"));
+        // Dropped back onto itself (a short drag): nothing happens, no error.
+        app.dialog = Dialog::None;
+        app.command(
+            &ctx,
+            Command::Move(vec!["tree/fresh".into()], "tree/fresh".into()),
+        );
+        assert!(app.job.is_none() && matches!(app.dialog, Dialog::None));
 
         // Nothing reaches the archive until Save.
         assert_eq!(std::fs::read(&archive).unwrap(), original);

@@ -1725,3 +1725,118 @@ fn single_file_streams_report_skips() {
     let warnings = hdec_core::extract(&archive, &out, &opts, &c).unwrap();
     assert_eq!(warnings.len(), 1, "{warnings:?}");
 }
+
+/// Cancels from inside the progress callback once `after` bytes are done.
+fn cancelling_ctx(after: u64) -> Ctx<'static> {
+    let cancel = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    Ctx {
+        password: None,
+        cancel,
+        progress: std::sync::Arc::new(move |done, _, _| {
+            if done >= after {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }),
+    }
+}
+
+/// Every file is complete or absent; nothing temporary is left.
+fn check_partial(out: &Path, src: &Path) {
+    for (name, data) in snapshot(out) {
+        assert!(!name.contains("hdec-tmp"), "{name}");
+        if data != b"<dir>" && !data.starts_with(b"-> ") {
+            let rel = name.strip_prefix("tree/").unwrap_or(&name);
+            assert_eq!(fs::read(src.join(rel)).unwrap(), data, "{name}");
+        }
+    }
+}
+
+#[test]
+fn cancelling_midway_leaves_no_partial_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("tree");
+    fs::create_dir(&src).unwrap();
+    for i in 0..300 {
+        let data: Vec<u8> = (0..20_000u32).map(|j| (j * 7 + i) as u8).collect();
+        fs::write(src.join(format!("f{i}.bin")), data).unwrap();
+    }
+    // Incompressible, so each step outlasts the 15 ms progress throttle.
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    let big: Vec<u8> = (0..30_000_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    fs::write(src.join("big.bin"), big).unwrap();
+    let ok = AtomicBool::new(false);
+    for format in [
+        Format::Zip,
+        Format::SevenZ,
+        Format::TarGz,
+        Format::TarBz2,
+        Format::TarXz,
+        Format::Rar,
+    ] {
+        let dir = tmp.path().join(format.extension());
+        fs::create_dir(&dir).unwrap();
+        let archive = dir.join(format!("a.{}", format.extension()));
+        let opts = CreateOptions {
+            format,
+            level: Level::Fast,
+            ..Default::default()
+        };
+        let r = hdec_core::create(
+            std::slice::from_ref(&src),
+            &archive,
+            &opts,
+            &cancelling_ctx(1),
+        );
+        assert!(
+            matches!(r, Err(Error::Cancelled)),
+            "{format:?} create: {r:?}"
+        );
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            0,
+            "{format:?} create left files"
+        );
+
+        hdec_core::create(std::slice::from_ref(&src), &archive, &opts, &ctx(None, &ok)).unwrap();
+        let before = fs::read(&archive).unwrap();
+        let out = tmp.path().join(format!("out-{}", format.extension()));
+        let r = hdec_core::extract(
+            &archive,
+            &out,
+            &ExtractOptions::default(),
+            &cancelling_ctx(1),
+        );
+        assert!(
+            matches!(r, Err(Error::Cancelled)),
+            "{format:?} extract: {r:?}"
+        );
+        check_partial(&out, &src);
+
+        let add = hdec_core::Edit::Add {
+            sources: vec![src.clone()],
+            into: "again".into(),
+        };
+        let r = hdec_core::modify(&archive, &add, &cancelling_ctx(1));
+        assert!(
+            matches!(r, Err(Error::Cancelled)),
+            "{format:?} modify: {r:?}"
+        );
+        assert!(
+            fs::read(&archive).unwrap() == before,
+            "{format:?} modify changed it"
+        );
+        let left: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 1, "{format:?} modify left {left:?}");
+    }
+}
