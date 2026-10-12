@@ -36,19 +36,23 @@ fn join_for(dest: &Path, name: &str, windows: bool) -> Result<PathBuf> {
 }
 
 /// True if a symlink at `link` (relative to the extraction dir) pointing to
-/// `target` resolves, lexically, to somewhere inside the extraction dir.
+/// `target` stays inside the extraction dir. `..` is allowed only at the
+/// start: it then climbs from the link's own (real) folder, so the check holds
+/// on disk too. After a name it could climb out of another symlink
+/// (`s -> .` then `t -> s/../outside`), which a lexical check can't see.
 pub fn link_stays_inside(link: &Path, target: &str) -> bool {
     let target = target.replace('\\', "/");
     if target.starts_with('/') || target.contains('\0') || target.contains(':') {
         return false;
     }
     let mut depth = link.parent().map_or(0, |p| p.components().count());
+    let mut named = false;
     for c in target.split('/') {
         match c {
             "" | "." => {}
-            ".." if depth == 0 => return false,
+            ".." if depth == 0 || named => return false,
             ".." => depth -= 1,
-            _ => depth += 1,
+            _ => named = true,
         }
     }
     true
@@ -155,7 +159,8 @@ mod tests {
         assert!(inside("a/link", "b.txt"));
         assert!(inside("a/link", "../b.txt"));
         assert!(inside("a/b/link", "../../c"));
-        assert!(inside("a/link", "x/../../y"));
+        assert!(!inside("a/link", "x/../../y"));
+        assert!(!inside("a/link", "s/../b.txt"));
         assert!(!inside("link", "../x"));
         assert!(!inside("a/link", "../../x"));
         assert!(!inside("a/link", "x/../../../y"));

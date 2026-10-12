@@ -359,7 +359,18 @@ impl Extractor {
             if fs::symlink_metadata(&path).is_ok() {
                 fs::remove_file(&path)?;
             }
-            if fs::hard_link(&target, &path).is_err() {
+            // `hard_link` follows symlinks on the way to the target: none allowed.
+            let through_link = target
+                .strip_prefix(&self.dest)
+                .map(|rel| {
+                    rel.ancestors()
+                        .filter(|a| !a.as_os_str().is_empty())
+                        .any(|a| {
+                            fs::symlink_metadata(self.dest.join(a)).is_ok_and(|m| m.is_symlink())
+                        })
+                })
+                .unwrap_or(true);
+            if through_link || fs::hard_link(&target, &path).is_err() {
                 let target = target.display();
                 self.warnings
                     .push(format!("skipped hard link {name} -> {target}"));

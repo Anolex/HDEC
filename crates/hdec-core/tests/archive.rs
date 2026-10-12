@@ -1465,3 +1465,38 @@ fn empty_inputs_round_trip() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn symlink_chains_and_hard_links_cant_escape() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("secret"), "outside").unwrap();
+    let archive = tmp.path().join("chain.tar");
+    let mut b = tar::Builder::new(fs::File::create(&archive).unwrap());
+    let mut link = |name: &str, target: &str, kind: tar::EntryType| {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(kind);
+        h.set_size(0);
+        b.append_link(&mut h, name, target).unwrap();
+    };
+    // Each looks inside on paper; together `t` would reach the parent of `out`.
+    link("s", ".", tar::EntryType::Symlink);
+    link("t", "s/../secret", tar::EntryType::Symlink);
+    link("h1", "t", tar::EntryType::Link);
+    // A hard link may not go through any symlink, even one that stays inside.
+    link("h2", "s/s/x", tar::EntryType::Link);
+    b.into_inner().unwrap();
+    let out = tmp.path().join("out");
+    let warnings = extract(&archive, &out, None).unwrap();
+    assert!(fs::symlink_metadata(out.join("t")).is_err(), "{warnings:?}");
+    assert!(
+        fs::symlink_metadata(out.join("h1")).is_err(),
+        "{warnings:?}"
+    );
+    assert!(
+        fs::symlink_metadata(out.join("h2")).is_err(),
+        "{warnings:?}"
+    );
+    assert_eq!(fs::read(tmp.path().join("secret")).unwrap(), b"outside");
+    assert_eq!(warnings.len(), 3, "{warnings:?}");
+}

@@ -2132,7 +2132,12 @@ fn create_form(ui: &mut egui::Ui, form: &mut CreateForm) -> Option<bool> {
             .parse::<f64>()
             .is_ok_and(|mb| mb >= 0.01);
     // Creating replaces an existing file of that name: say so before it happens.
-    let exists = valid_name(form.name.trim()) && form.dest().exists();
+    let exists = valid_name(form.name.trim()) && {
+        let dest = form.dest();
+        let mut first_part = dest.clone().into_os_string();
+        first_part.push(".001");
+        dest.exists() || (form.split && Path::new(&first_part).exists())
+    };
     let mut result = None;
     theme::dialog_footer(ui, |ui| {
         if theme::primary_button(
@@ -2413,13 +2418,48 @@ fn sort_rows(rows: &mut [Entry], key: SortKey, descending: bool) {
 }
 
 /// `photos.tar.gz` → `photos`
+/// `photos.tar.gz` → `photos`, `Report 1.5.zip` → `Report 1.5`,
+/// `set.part2.rar` / `set.7z.003` → `set`.
 fn archive_stem(path: &Path) -> String {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let stem = name.split_once('.').map_or(&*name, |(s, _)| s);
-    if stem.is_empty() {
+    let mut name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let cut = |name: &mut String, suffix: &str| {
+        let keep = name.len().saturating_sub(suffix.len());
+        let matches = name.is_char_boundary(keep) && name[keep..].eq_ignore_ascii_case(suffix);
+        if matches {
+            name.truncate(keep);
+        }
+        matches
+    };
+    // Volume numbers: `.001`, `.r00`, `.part2` (before `.rar`).
+    if let Some((base, n)) = name.rsplit_once('.')
+        && n.len() == 3
+        && n.trim_start_matches(['r', 'R'])
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+    {
+        name = base.to_owned();
+    }
+    let compound = [".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tar.lz"];
+    if !compound.iter().any(|ext| cut(&mut name, ext)) {
+        if let Some((base, _)) = name.rsplit_once('.') {
+            name = base.to_owned();
+        }
+        if let Some((base, part)) = name.rsplit_once('.')
+            && part.len() > 4
+            && part[..4].eq_ignore_ascii_case("part")
+            && part[4..].bytes().all(|b| b.is_ascii_digit())
+        {
+            name = base.to_owned();
+        }
+    }
+    if name.is_empty() {
         "archive".into()
     } else {
-        stem.into()
+        name
     }
 }
 
@@ -2801,6 +2841,15 @@ mod tests {
     fn helpers() {
         assert_eq!(archive_stem(Path::new("/x/photos.tar.gz")), "photos");
         assert_eq!(archive_stem(Path::new(".hidden")), "archive");
+        assert_eq!(
+            archive_stem(Path::new("Report 1.5 final.zip")),
+            "Report 1.5 final"
+        );
+        assert_eq!(archive_stem(Path::new("set.part02.rar")), "set");
+        assert_eq!(archive_stem(Path::new("set.r01")), "set");
+        assert_eq!(archive_stem(Path::new("data.7z.003")), "data");
+        assert_eq!(archive_stem(Path::new("A.TGZ")), "A");
+        assert_eq!(archive_stem(Path::new("noext")), "noext");
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(1536), "1.5 KB");
         assert_eq!(base_name("a/b/c.txt"), "c.txt");
