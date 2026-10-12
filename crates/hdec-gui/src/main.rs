@@ -313,7 +313,9 @@ impl App {
             }
             Action::Modify(edit) => {
                 if let Some((original, work)) = seed {
-                    std::fs::copy(original, work)?;
+                    std::fs::copy(original, &work).inspect_err(|_| {
+                        let _ = std::fs::remove_file(&work);
+                    })?;
                 }
                 hdec_core::modify(archive.as_deref().unwrap(), &edit, c).map(|_| Outcome::Modified)
             }
@@ -378,6 +380,10 @@ impl App {
         }
         let Some(result) = done else { return };
         let job = self.job.take().unwrap();
+        if result.is_err() && self.working.as_ref().is_some_and(|w| !w.dirty) {
+            // Nothing saved-worthy in it, and a failed first edit may have left it half-copied.
+            self.working = None;
+        }
         match result {
             Ok(outcome) => {
                 if job.password.is_some() {
@@ -2125,11 +2131,13 @@ fn create_form(ui: &mut egui::Ui, form: &mut CreateForm) -> Option<bool> {
             .trim()
             .parse::<f64>()
             .is_ok_and(|mb| mb >= 0.01);
+    // Creating replaces an existing file of that name: say so before it happens.
+    let exists = valid_name(form.name.trim()) && form.dest().exists();
     let mut result = None;
     theme::dialog_footer(ui, |ui| {
         if theme::primary_button(
             ui,
-            "Create",
+            if exists { "Replace" } else { "Create" },
             !mismatch
                 && !bad_split
                 && valid_name(form.name.trim())
@@ -2142,6 +2150,17 @@ fn create_form(ui: &mut egui::Ui, form: &mut CreateForm) -> Option<bool> {
         }
         if theme::button(ui, "Cancel").clicked() {
             result = Some(false);
+        }
+        if exists {
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                let name = form.dest();
+                let name = name.file_name().unwrap_or_default().to_string_lossy();
+                ui.label(
+                    RichText::new(format!("{name} already exists"))
+                        .size(11.5)
+                        .color(p.danger),
+                );
+            });
         }
     });
     result
