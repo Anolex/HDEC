@@ -143,6 +143,7 @@ Each phase ends with: `cargo fmt --check`, `cargo clippy --all-targets -- -D war
 | Notarization / Authenticode need paid certs | needed only at P9 |
 
 ## 8. Decisions log
+- 2026-10-12: Files opened from an archive are watched (mtime, polled every second); a change prompts to save it back via `Edit::Add` into the entry's folder. Read-only archives (RAR, split, SFX, single streams) show a "Read-only" badge and say why on hover.
 - 2026-10-12: File-manager editing: `Edit::Rename` takes several (from, to) pairs (moves), `Edit::CreateDir`; `modify` rejects collisions, invalid names and moving a folder into itself. `Entry.link` carries symlink targets. GUI: drag rows onto folders/tree/breadcrumb to move, double-click opens a file with the default app (extracted to a temp dir), New folder, empty-area context menu, F2 / Cmd+Shift+N. Dropping files on an open editable archive always adds them to the current folder. `zip` needs its `unreserved` feature to raw-copy Info-ZIP extra fields.
 - 2026-10-12: UI redesigned from an HTML mockup (`docs/ui-mockup.html`): toolbar with icons, breadcrumb, folder tree, sortable table with ratio, filter across the whole archive, context menu, keyboard shortcuts, card dialogs, dark + light themes. Icons via `egui-phosphor`. Headless screenshots via `egui_kittest` (dev-only).
 - 2026-10-11: RAR via `rars` instead of a hand-written decoder (P6–P7 collapsed). `Ctx` cancel/progress became `Arc`s because `rars` wants `'static` writers.

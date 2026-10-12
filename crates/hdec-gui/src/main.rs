@@ -76,7 +76,7 @@ enum Outcome {
     Tested,
     Created(PathBuf),
     Modified,
-    Previewed(PathBuf),
+    Previewed { entry: String, file: PathBuf },
 }
 
 enum Msg {
@@ -107,6 +107,10 @@ enum Dialog {
         name: String,
     },
     NewFolder(String),
+    SaveBack {
+        entry: String,
+        file: PathBuf,
+    },
     Password {
         input: Zeroizing<String>,
         then: Action,
@@ -189,6 +193,16 @@ struct App {
     /// Where entries opened with the default app are extracted; removed on exit.
     preview_dir: Option<tempfile::TempDir>,
     previews: u32,
+    /// Files opened with the default app, watched for edits to save back.
+    opened: Vec<OpenedFile>,
+    /// Why the open archive can't be edited, if it can't.
+    read_only: Option<&'static str>,
+}
+
+struct OpenedFile {
+    entry: String,
+    file: PathBuf,
+    modified: Option<SystemTime>,
 }
 
 impl App {
@@ -223,9 +237,8 @@ impl App {
                     overwrite: Overwrite::Replace,
                 };
                 hdec_core::extract(archive.as_deref().unwrap(), &dir, &opts, c)?;
-                Ok(Outcome::Previewed(hdec_core::safe_path::join(
-                    &dir, &entry,
-                )?))
+                let file = hdec_core::safe_path::join(&dir, &entry)?;
+                Ok(Outcome::Previewed { entry, file })
             }
         });
     }
@@ -308,15 +321,17 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{title} — HDEC")));
                 let reopened = self.archive.as_ref() == Some(&path);
                 self.modifiable = hdec_core::modifiable(&path);
+                self.read_only = (!self.modifiable).then(|| read_only_reason(&path, self.format));
                 self.total_size = entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
                 self.any_encrypted = entries.iter().any(|e| e.encrypted);
                 self.dirs = dir_tree(&entries);
                 self.archive = Some(path);
                 self.entries = entries;
-                self.status.clear();
                 if !reopened {
+                    self.status.clear();
                     self.expanded.clear();
                     self.filter.clear();
+                    self.opened.clear();
                 }
                 let keep = reopened && self.dirs.contains_key(&self.cwd);
                 self.navigate(if keep {
@@ -340,11 +355,20 @@ impl App {
                 let path = self.archive.clone().unwrap();
                 self.run(ctx, Action::Open(path), self.password.clone());
             }
-            Outcome::Previewed(path) => {
-                if let Err(e) = launch(&path) {
-                    self.dialog = Dialog::Error(format!("Couldn't open {}: {e}", path.display()));
+            Outcome::Previewed { entry, file } => match launch(&file) {
+                Ok(()) => {
+                    let modified = modified_time(&file);
+                    self.opened.retain(|o| o.file != file);
+                    self.opened.push(OpenedFile {
+                        entry,
+                        file,
+                        modified,
+                    });
                 }
-            }
+                Err(e) => {
+                    self.dialog = Dialog::Error(format!("Couldn't open {}: {e}", file.display()))
+                }
+            },
         }
     }
 
@@ -533,6 +557,39 @@ impl App {
         }
     }
 
+    /// Notices files opened from the archive that were changed in another app.
+    fn check_opened(&mut self) {
+        if self.job.is_some() || !matches!(self.dialog, Dialog::None) {
+            return;
+        }
+        for opened in &mut self.opened {
+            let now = modified_time(&opened.file);
+            if now.is_none() || now == opened.modified {
+                continue;
+            }
+            opened.modified = now;
+            let name = base_name(&opened.entry).to_owned();
+            if let Some(reason) = self.read_only {
+                self.status = format!("Changes to {name} can't be saved: {reason}");
+            } else {
+                self.dialog = Dialog::SaveBack {
+                    entry: opened.entry.clone(),
+                    file: opened.file.clone(),
+                };
+            }
+            return;
+        }
+    }
+
+    fn save_back(&mut self, ctx: &egui::Context, entry: &str, file: PathBuf) {
+        let edit = Edit::Add {
+            sources: vec![file],
+            into: parent_of(entry).to_owned(),
+        };
+        self.status = format!("Saved {}", base_name(entry));
+        self.run(ctx, Action::Modify(edit), self.password.clone());
+    }
+
     fn preview(&mut self, ctx: &egui::Context, entry: String) {
         if self.preview_dir.is_none() {
             match tempfile::Builder::new().prefix("hdec-open").tempdir() {
@@ -602,7 +659,18 @@ impl App {
                 self.run(ui.ctx(), Action::Test, self.password.clone());
             }
             theme::tool_separator(ui);
-            let add = theme::tool_button(ui, icon::FILE_PLUS, "Add", can_edit, false);
+            let read_only = self.read_only.filter(|_| has);
+            let why = |r: egui::Response| match read_only {
+                Some(reason) => r.on_hover_text(reason),
+                None => r,
+            };
+            let add = why(theme::tool_button(
+                ui,
+                icon::FILE_PLUS,
+                "Add",
+                can_edit,
+                false,
+            ));
             egui::Popup::menu(&add).show(|ui| {
                 if ui.button(format!("{}  Files…", icon::FILE_PLUS)).clicked() {
                     self.command(ui.ctx(), Command::AddFiles);
@@ -614,27 +682,35 @@ impl App {
                     self.command(ui.ctx(), Command::AddFolder);
                 }
             });
-            if theme::tool_button(ui, icon::FOLDER_PLUS, "New folder", can_edit, false).clicked() {
+            if why(theme::tool_button(
+                ui,
+                icon::FOLDER_PLUS,
+                "New folder",
+                can_edit,
+                false,
+            ))
+            .clicked()
+            {
                 self.command(ui.ctx(), Command::NewFolder);
             }
-            if theme::tool_button(
+            if why(theme::tool_button(
                 ui,
                 icon::TRASH,
                 "Delete",
                 can_edit && !self.selected.is_empty(),
                 false,
-            )
+            ))
             .clicked()
             {
                 self.start_delete();
             }
-            if theme::tool_button(
+            if why(theme::tool_button(
                 ui,
                 icon::PENCIL_SIMPLE,
                 "Rename",
                 can_edit && self.selected.len() == 1,
                 false,
-            )
+            ))
             .clicked()
             {
                 self.start_rename();
@@ -1150,6 +1226,11 @@ impl App {
             }
             if self.archive.is_some() {
                 theme::pill(ui, self.format);
+                if let Some(reason) = self.read_only {
+                    let badge = format!("{} Read-only", icon::LOCK_SIMPLE);
+                    ui.label(RichText::new(badge).color(p.muted))
+                        .on_hover_text(reason);
+                }
                 ui.label(
                     RichText::new(format!(
                         "{} items · {}",
@@ -1337,6 +1418,36 @@ impl App {
                     }
                     Some(false) => Dialog::None,
                     None => Dialog::Rename { from, name },
+                }
+            }
+            Dialog::SaveBack { entry, file } => {
+                let subtitle = format!("{} was changed in another app.", base_name(&entry));
+                let result = theme::dialog(
+                    ctx,
+                    icon::FLOPPY_DISK,
+                    "Save changes to the archive?",
+                    &subtitle,
+                    |ui| {
+                        ui.label(format!("Update “{entry}” in {archive_name}?"));
+                        let mut result = None;
+                        theme::dialog_footer(ui, |ui| {
+                            if theme::primary_button(ui, "Update archive", true).clicked() {
+                                result = Some(true);
+                            }
+                            if theme::button(ui, "Not now").clicked() {
+                                result = Some(false);
+                            }
+                        });
+                        result
+                    },
+                );
+                match result {
+                    Some(true) => {
+                        self.save_back(ctx, &entry, file);
+                        Dialog::None
+                    }
+                    Some(false) => Dialog::None,
+                    None => Dialog::SaveBack { entry, file },
                 }
             }
             Dialog::NewFolder(mut name) => {
@@ -1539,6 +1650,10 @@ impl eframe::App for App {
             }
         }
         self.shortcuts(&ctx);
+        if !self.opened.is_empty() {
+            self.check_opened();
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
 
         let bar = |fill| {
             egui::Frame::new()
@@ -1819,6 +1934,26 @@ fn launch(path: &Path) -> std::io::Result<()> {
         .map(drop)
 }
 
+fn modified_time(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn read_only_reason(path: &Path, format: &str) -> &'static str {
+    let name = path.to_string_lossy().to_ascii_lowercase();
+    let ext = name.rsplit_once('.').map_or("", |(_, e)| e);
+    if ext.len() == 3 && ext.bytes().all(|b| b.is_ascii_digit()) {
+        "Split archives are read-only. Extract it, or convert it to a single archive."
+    } else if ext == "exe" {
+        "Self-extracting archives are read-only."
+    } else if format == "RAR" {
+        "RAR archives are read-only: the RAR license forbids creating RAR files. Extract and re-pack as 7Z or ZIP to edit."
+    } else if matches!(format, "GZ" | "XZ" | "BZ2" | "ZST" | "LZ" | "LZMA") {
+        "This is a single compressed file, not an archive of files."
+    } else {
+        "HDEC can read this format but not write it."
+    }
+}
+
 fn valid_name(name: &str) -> bool {
     let name = name.trim();
     !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".."
@@ -2095,6 +2230,59 @@ mod tests {
         assert!(has(&app, "tree/fresh"));
     }
 
+    #[test]
+    fn saves_edited_files_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("t.zip");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../hdec-core/tests/fixtures/infozip.zip");
+        std::fs::copy(fixture, &archive).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open(&ctx, archive.clone());
+        pump(&mut app, &ctx);
+
+        // As if `Open` extracted tree/sub/b.txt and an editor then saved it.
+        let file = tmp.path().join("edit/tree/sub/b.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "edited").unwrap();
+        let entry = "tree/sub/b.txt".to_string();
+        app.opened.push(OpenedFile {
+            entry: entry.clone(),
+            file: file.clone(),
+            modified: Some(SystemTime::UNIX_EPOCH),
+        });
+        app.check_opened();
+        let Dialog::SaveBack { entry: e, file: f } = std::mem::take(&mut app.dialog) else {
+            panic!("no save prompt")
+        };
+        app.save_back(&ctx, &e, f);
+        pump(&mut app, &ctx);
+        app.check_opened();
+        assert!(
+            matches!(app.dialog, Dialog::None),
+            "no second prompt for the same change"
+        );
+
+        let out = tmp.path().join("out");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = Ctx {
+            password: None,
+            cancel,
+            progress: Arc::new(|_, _, _| {}),
+        };
+        hdec_core::extract(&archive, &out, &ExtractOptions::default(), &c).unwrap();
+        assert_eq!(std::fs::read(out.join(&entry)).unwrap(), b"edited");
+        assert_eq!(app.entries.iter().filter(|e| e.path == entry).count(), 1);
+
+        // Read-only archives say why instead of prompting.
+        app.read_only = Some(read_only_reason(Path::new("x.rar"), "RAR"));
+        std::fs::write(&file, "again").unwrap();
+        app.opened[0].modified = Some(SystemTime::UNIX_EPOCH);
+        app.check_opened();
+        assert!(matches!(app.dialog, Dialog::None) && app.status.contains("RAR"));
+    }
+
     /// Renders each UI state to `target/ui-shots/*.png` for eyeballing.
     /// Run with `cargo test -p hdec-gui -- --ignored screenshots`.
     #[test]
@@ -2119,7 +2307,14 @@ mod tests {
             app.navigate("tree/sub".into());
             app.selected.insert("tree/sub/b.txt".into());
         };
-        let states: [(&str, Setup); 9] = [
+        let states: [(&str, Setup); 10] = [
+            ("saveback", |app, ctx, path, entries| {
+                app.finish(ctx, Outcome::Opened(path.to_path_buf(), entries.to_vec()));
+                app.dialog = Dialog::SaveBack {
+                    entry: "tree/sub/b.txt".into(),
+                    file: PathBuf::new(),
+                };
+            }),
             ("links", |app, ctx, path, entries| {
                 app.finish(ctx, Outcome::Opened(path.to_path_buf(), entries.to_vec()));
                 app.navigate("tree".into());
