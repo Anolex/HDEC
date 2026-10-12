@@ -1,0 +1,229 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>HDEC mockup</title>
+<link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css">
+<link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/fill/style.css">
+<style>
+:root {
+  --bg: #17191d; --panel: #1f2226; --panel2: #25292e; --border: #30353c;
+  --text: #e4e7eb; --muted: #8a919b; --faint: #5d646e;
+  --accent: #4f8cff; --accent-soft: rgba(79,140,255,.16); --hover: rgba(255,255,255,.04);
+  --folder: #e0a84e; --danger: #ef5b5b; --ok: #4cc38a; --r: 6px;
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: #0e0f11; font: 13px/1.35 -apple-system, "Segoe UI", system-ui, sans-serif; color: var(--text); display: flex; flex-direction: column; gap: 28px; align-items: flex-start; }
+h2 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 500; letter-spacing: .04em; text-transform: uppercase; }
+.win { width: 1040px; height: 600px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; position: relative; }
+.titlebar { height: 30px; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 12px; position: relative; background: var(--panel); }
+.titlebar .dots { position: absolute; left: 12px; display: flex; gap: 8px; }
+.titlebar .dots i { width: 12px; height: 12px; border-radius: 50%; display: block; background: #ff5f57; }
+.titlebar .dots i:nth-child(2) { background: #febc2e; } .titlebar .dots i:nth-child(3) { background: #28c840; }
+
+.toolbar { display: flex; align-items: center; gap: 2px; padding: 6px 10px; background: var(--panel); border-bottom: 1px solid var(--border); }
+.tb { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 5px 9px; border-radius: var(--r); color: var(--text); min-width: 54px; }
+.tb i { font-size: 20px; }
+.tb span { font-size: 11px; color: var(--muted); }
+.tb:hover { background: var(--hover); }
+.tb.primary i { color: var(--accent); }
+.tb.disabled { opacity: .35; }
+.sep { width: 1px; height: 32px; background: var(--border); margin: 0 6px; }
+.spacer { flex: 1; }
+.search { display: flex; align-items: center; gap: 6px; width: 220px; height: 28px; padding: 0 8px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r); color: var(--faint); }
+
+.pathbar { display: flex; align-items: center; gap: 4px; padding: 5px 10px; border-bottom: 1px solid var(--border); background: var(--bg); }
+.iconbtn { width: 26px; height: 24px; display: grid; place-items: center; border-radius: var(--r); color: var(--muted); }
+.iconbtn:hover { background: var(--hover); }
+.crumb { display: flex; align-items: center; gap: 5px; padding: 3px 7px; border-radius: var(--r); color: var(--muted); }
+.crumb:hover { background: var(--hover); color: var(--text); }
+.crumb.cur { color: var(--text); }
+.chev { color: var(--faint); font-size: 11px; }
+
+.body { flex: 1; display: flex; min-height: 0; }
+.side { width: 210px; border-right: 1px solid var(--border); padding: 8px 6px; background: var(--panel); overflow: auto; }
+.node { display: flex; align-items: center; gap: 5px; height: 24px; padding: 0 6px; border-radius: var(--r); white-space: nowrap; }
+.node .caret { width: 12px; color: var(--faint); font-size: 10px; }
+.node i.f { color: var(--folder); font-size: 15px; }
+.node.sel { background: var(--accent-soft); }
+.node:hover { background: var(--hover); }
+
+.list { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+th { text-align: left; font-weight: 500; font-size: 12px; color: var(--muted); padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th.num, td.num { text-align: right; }
+th .sort { color: var(--accent); font-size: 10px; margin-left: 3px; }
+td { padding: 0 10px; height: 26px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+td.num, td.date { color: var(--muted); font-variant-numeric: tabular-nums; }
+tr:hover td { background: var(--hover); }
+tr.sel td { background: var(--accent-soft); }
+.name { display: flex; align-items: center; gap: 7px; }
+.name i { font-size: 16px; color: var(--muted); }
+.name i.f { color: var(--folder); }
+.lock { color: var(--folder); font-size: 12px; margin-left: 4px; }
+
+.status { height: 28px; display: flex; align-items: center; gap: 12px; padding: 0 10px; border-top: 1px solid var(--border); background: var(--panel); color: var(--muted); font-size: 12px; }
+.pill { padding: 1px 7px; border-radius: 10px; background: var(--accent-soft); color: var(--accent); font-weight: 600; font-size: 11px; }
+.prog { display: flex; align-items: center; gap: 10px; flex: 1; }
+.bar { flex: 1; max-width: 340px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+.bar b { display: block; height: 100%; width: 62%; background: var(--accent); }
+.btn { height: 28px; padding: 0 14px; border-radius: var(--r); border: 1px solid var(--border); background: var(--panel2); color: var(--text); display: inline-flex; align-items: center; gap: 6px; font: inherit; }
+.btn.small { height: 22px; padding: 0 9px; font-size: 12px; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: white; }
+
+.empty { flex: 1; display: grid; place-items: center; }
+.drop { width: 480px; padding: 40px; border: 1.5px dashed var(--border); border-radius: 14px; text-align: center; }
+.drop i.big { font-size: 56px; color: var(--accent); }
+.drop h3 { margin: 12px 0 4px; font-size: 17px; font-weight: 600; }
+.drop p { margin: 0 0 18px; color: var(--muted); }
+.drop .row { display: flex; gap: 8px; justify-content: center; }
+.drop small { display: block; margin-top: 18px; color: var(--faint); }
+
+.scrim { position: absolute; inset: 0; background: rgba(0,0,0,.45); display: grid; place-items: center; }
+.dlg { width: 470px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 20px 60px rgba(0,0,0,.5); }
+.dlg header { display: flex; align-items: center; gap: 8px; padding: 14px 18px 4px; font-size: 15px; font-weight: 600; }
+.dlg header i { color: var(--accent); font-size: 20px; }
+.dlg .sub { padding: 0 18px 10px; color: var(--muted); font-size: 12px; }
+.form { padding: 6px 18px 14px; display: grid; grid-template-columns: 96px 1fr; gap: 10px 12px; align-items: center; }
+.form label { color: var(--muted); text-align: right; }
+.input { height: 28px; display: flex; align-items: center; padding: 0 8px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r); gap: 6px; }
+.input.grow { flex: 1; }
+.rowx { display: flex; gap: 6px; align-items: center; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: var(--r); overflow: hidden; }
+.seg span { padding: 4px 11px; border-right: 1px solid var(--border); color: var(--muted); }
+.seg span:last-child { border-right: 0; }
+.seg span.on { background: var(--accent-soft); color: var(--accent); }
+.check { display: flex; align-items: center; gap: 7px; }
+.box { width: 15px; height: 15px; border-radius: 4px; border: 1px solid var(--faint); display: grid; place-items: center; font-size: 11px; }
+.box.on { background: var(--accent); border-color: var(--accent); color: white; }
+.hint { grid-column: 2; color: var(--faint); font-size: 11.5px; margin-top: -4px; }
+.dlg footer { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 18px; border-top: 1px solid var(--border); }
+.dim { opacity: .4; }
+</style>
+</head>
+<body>
+
+<div>
+<h2>1 · Archive open</h2>
+<div class="win">
+  <div class="titlebar"><div class="dots"><i></i><i></i><i></i></div>rar5.rar — HDEC</div>
+  <div class="toolbar">
+    <div class="tb"><i class="ph ph-folder-open"></i><span>Open</span></div>
+    <div class="tb"><i class="ph ph-plus-square"></i><span>New</span></div>
+    <div class="sep"></div>
+    <div class="tb primary"><i class="ph ph-export"></i><span>Extract</span></div>
+    <div class="tb"><i class="ph ph-check-circle"></i><span>Test</span></div>
+    <div class="sep"></div>
+    <div class="tb disabled"><i class="ph ph-file-plus"></i><span>Add</span></div>
+    <div class="tb disabled"><i class="ph ph-trash"></i><span>Delete</span></div>
+    <div class="tb disabled"><i class="ph ph-pencil-simple"></i><span>Rename</span></div>
+    <div class="spacer"></div>
+    <div class="search"><i class="ph ph-magnifying-glass"></i>Filter</div>
+  </div>
+  <div class="pathbar">
+    <div class="iconbtn"><i class="ph ph-arrow-up"></i></div>
+    <div class="crumb"><i class="ph ph-file-archive"></i>rar5.rar</div><span class="chev"><i class="ph ph-caret-right"></i></span>
+    <div class="crumb">tree</div><span class="chev"><i class="ph ph-caret-right"></i></span>
+    <div class="crumb cur">sub</div>
+  </div>
+  <div class="body">
+    <div class="side">
+      <div class="node"><span class="caret"><i class="ph ph-caret-down"></i></span><i class="ph ph-file-archive" style="color:var(--accent)"></i>rar5.rar</div>
+      <div class="node" style="padding-left:20px"><span class="caret"><i class="ph ph-caret-down"></i></span><i class="ph-fill ph-folder f"></i>tree</div>
+      <div class="node" style="padding-left:38px"><span class="caret"></span><i class="ph-fill ph-folder f"></i>empty</div>
+      <div class="node sel" style="padding-left:38px"><span class="caret"></span><i class="ph-fill ph-folder-open f"></i>sub</div>
+    </div>
+    <div class="list">
+      <table>
+        <colgroup><col><col style="width:96px"><col style="width:96px"><col style="width:70px"><col style="width:150px"></colgroup>
+        <tr><th>Name <span class="sort"><i class="ph ph-caret-up"></i></span></th><th class="num">Size</th><th class="num">Packed</th><th class="num">Ratio</th><th>Modified</th></tr>
+        <tr><td><div class="name"><i class="ph-fill ph-folder f"></i>deeper</div></td><td class="num"></td><td class="num"></td><td class="num"></td><td class="date">2017-07-14 04:40</td></tr>
+        <tr class="sel"><td><div class="name"><i class="ph ph-file-text"></i>b.txt</div></td><td class="num">5 B</td><td class="num">5 B</td><td class="num">100%</td><td class="date">2017-07-14 04:40</td></tr>
+        <tr><td><div class="name"><i class="ph ph-file-image"></i>photo.jpg<i class="ph-fill ph-lock-simple lock"></i></div></td><td class="num">2.4 MB</td><td class="num">2.3 MB</td><td class="num">97%</td><td class="date">2026-10-01 18:22</td></tr>
+        <tr><td><div class="name"><i class="ph ph-file"></i>big.bin</div></td><td class="num">293.0 KB</td><td class="num">1.2 KB</td><td class="num">0%</td><td class="date">2017-07-14 04:40</td></tr>
+        <tr><td><div class="name"><i class="ph ph-file-text"></i>ünï.txt</div></td><td class="num">7 B</td><td class="num">7 B</td><td class="num">100%</td><td class="date">2017-07-14 04:40</td></tr>
+      </table>
+    </div>
+  </div>
+  <div class="status">
+    <span class="pill">RAR</span><span>9 items · 293.2 KB</span><span>1 selected · 5 B</span>
+    <span class="spacer"></span><span><i class="ph-fill ph-lock-simple" style="color:var(--folder)"></i> Some files are encrypted</span>
+  </div>
+</div>
+</div>
+
+<div>
+<h2>2 · Working (progress replaces the status bar)</h2>
+<div class="win" style="height:auto">
+  <div class="status" style="border-top:0">
+    <div class="prog"><i class="ph ph-export" style="color:var(--accent)"></i><span style="color:var(--text)">Extracting</span><div class="bar"><b></b></div><span>62% · tree/big.bin</span></div>
+    <button class="btn small">Cancel</button>
+  </div>
+</div>
+</div>
+
+<div>
+<h2>3 · Nothing open</h2>
+<div class="win" style="height:420px">
+  <div class="titlebar"><div class="dots"><i></i><i></i><i></i></div>HDEC</div>
+  <div class="toolbar">
+    <div class="tb"><i class="ph ph-folder-open"></i><span>Open</span></div>
+    <div class="tb"><i class="ph ph-plus-square"></i><span>New</span></div>
+    <div class="sep"></div>
+    <div class="tb disabled"><i class="ph ph-export"></i><span>Extract</span></div>
+    <div class="tb disabled"><i class="ph ph-check-circle"></i><span>Test</span></div>
+  </div>
+  <div class="empty">
+    <div class="drop">
+      <i class="ph ph-file-archive big"></i>
+      <h3>Drop files here</h3>
+      <p>An archive opens it. Anything else starts a new archive.</p>
+      <div class="row"><button class="btn primary"><i class="ph ph-folder-open"></i>Open archive…</button><button class="btn"><i class="ph ph-plus-square"></i>New archive…</button></div>
+      <small>ZIP · 7Z · RAR · TAR · GZ · XZ · BZ2 · ZST · LZ · SFX</small>
+    </div>
+  </div>
+</div>
+</div>
+
+<div>
+<h2>4 · New archive dialog</h2>
+<div class="win" style="height:560px">
+  <div class="scrim" style="background:transparent">
+  <div class="dlg">
+    <header><i class="ph ph-plus-square"></i>New archive</header>
+    <div class="sub">3 items · 12.4 MB</div>
+    <div class="form">
+      <label>Save as</label><div class="rowx"><div class="input grow">~/Desktop/photos.7z</div><button class="btn">Browse…</button></div>
+      <label>Format</label><div class="seg"><span>ZIP</span><span class="on">7Z</span><span>TAR.GZ</span><span>TAR.XZ</span><span>More ▾</span></div>
+      <label>Compression</label><div class="seg"><span>Store</span><span>Fast</span><span class="on">Normal</span><span>Max</span></div>
+      <label>Password</label><div class="input">••••••••<span class="spacer"></span><i class="ph ph-eye" style="color:var(--muted)"></i></div>
+      <label>Confirm</label><div class="input">••••••••</div>
+      <div class="hint">AES-256. File names are encrypted too.</div>
+      <label>Split</label><div class="rowx"><div class="check"><div class="box on"><i class="ph ph-check"></i></div></div><div class="input" style="width:80px">700</div><span style="color:var(--muted)">MB</span><button class="btn small">CD</button><button class="btn small">FAT32</button></div>
+    </div>
+    <footer><button class="btn">Cancel</button><button class="btn primary">Create</button></footer>
+  </div>
+  </div>
+</div>
+</div>
+
+<div>
+<h2>5 · Extract dialog</h2>
+<div class="win" style="height:330px">
+  <div class="scrim" style="background:transparent">
+  <div class="dlg">
+    <header><i class="ph ph-export"></i>Extract</header>
+    <div class="sub">All 9 items from rar5.rar</div>
+    <div class="form">
+      <label>To</label><div class="rowx"><div class="input grow">~/Downloads</div><button class="btn">Browse…</button></div>
+      <label></label><div class="check"><div class="box on"><i class="ph ph-check"></i></div>Into a new folder “rar5”</div>
+      <label>If file exists</label><div class="seg"><span class="on">Skip</span><span>Replace</span><span>Keep both</span></div>
+    </div>
+    <footer><button class="btn">Cancel</button><button class="btn primary">Extract</button></footer>
+  </div>
+  </div>
+</div>
+</div>
+
+</body>
+</html>

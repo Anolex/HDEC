@@ -4,7 +4,7 @@ Cross-platform (macOS + Windows) GUI archiver in 100% Rust. Full plan, scope and
 
 ## Layout
 - `crates/hdec-core` — library: format detection, list/extract/test/create/modify. No GUI deps.
-- `crates/hdec-gui` — binary `hdec`, eframe/egui front end. Talks to core only through its public API.
+- `crates/hdec-gui` — binary `hdec`, eframe/egui front end. Talks to core only through its public API. `theme.rs` holds colors, fonts (Phosphor icons) and custom widgets; the design reference is `docs/ui-mockup.html`. After UI changes, render the screenshots and look at them.
 - Formats live in `crates/hdec-core/src/formats/<format>.rs`; dispatch is a `match Format` in `lib.rs`.
 
 ## Commands
@@ -14,6 +14,7 @@ cargo test
 cargo run -p hdec-gui -- [archive]
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+cargo test -p hdec-gui -- --ignored screenshots   # renders every UI state (dark + light) to target/ui-shots/*.png
 for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do cargo tree -i cc --target $t -e normal,build; done   # each must print "nothing to print"
 ```
 

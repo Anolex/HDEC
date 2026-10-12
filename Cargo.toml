@@ -26,6 +26,9 @@ eframe = "0.36.2"
 egui_extras = "0.36.2"
 rfd = "0.17.2"
 zeroize = "1.9.1"
+# dev-only: headless screenshots of the GUI
+egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu", "snapshot"] }
+egui-phosphor = { version = "0.14.0", features = ["regular", "fill"] }
 
 # Compression crates are unusably slow unoptimized; keep our own code debuggable.
 [profile.dev.package."*"]

@@ -14,3 +14,7 @@ egui_extras.workspace = true
 rfd.workspace = true
 zeroize.workspace = true
 jiff.workspace = true
+egui-phosphor.workspace = true
+
+[dev-dependencies]
+egui_kittest.workspace = true

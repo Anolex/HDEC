@@ -143,6 +143,7 @@ Each phase ends with: `cargo fmt --check`, `cargo clippy --all-targets -- -D war
 | Notarization / Authenticode need paid certs | needed only at P9 |
 
 ## 8. Decisions log
+- 2026-10-12: UI redesigned from an HTML mockup (`docs/ui-mockup.html`): toolbar with icons, breadcrumb, folder tree, sortable table with ratio, filter across the whole archive, context menu, keyboard shortcuts, card dialogs, dark + light themes. Icons via `egui-phosphor`. Headless screenshots via `egui_kittest` (dev-only).
 - 2026-10-11: RAR via `rars` instead of a hand-written decoder (P6–P7 collapsed). `Ctx` cancel/progress became `Arc`s because `rars` wants `'static` writers.
 - 2026-10-11: Split = create whole archive, then cut into parts (needs 2× disk briefly). Modify: ZIP raw-copies entries; 7Z/TAR extract to a scratch dir next to the archive, edit, re-create at Normal level; refuses if any entry would be skipped as unsafe.
 - 2026-10-11: 7Z: solid blocks of 256 MiB, file names always encrypted when a password is set, unix modes/symlinks stored p7zip-style (attribute 0x8000 + st_mode<<16). Interop verified against bsdtar (libarchive) both ways; AES interop with real 7-Zip still to do.
