@@ -586,6 +586,77 @@ impl<R: io::Seek> io::Seek for CountingRead<'_, R> {
     }
 }
 
+/// Runs `work(i)` for `i in 0..n` on `threads` threads and hands the results
+/// to `consume` in order, with at most `ahead` results waiting. The first
+/// error (from either side) stops everything.
+fn ordered_parallel<T: Send>(
+    n: usize,
+    threads: usize,
+    ahead: usize,
+    work: impl Fn(usize) -> Result<T> + Sync,
+    mut consume: impl FnMut(usize, T) -> Result<()>,
+) -> Result<()> {
+    use std::sync::{Condvar, Mutex};
+    struct State<T> {
+        next: usize,
+        consumed: usize,
+        done: std::collections::BTreeMap<usize, Result<T>>,
+        stop: bool,
+    }
+    let state = Mutex::new(State {
+        next: 0,
+        consumed: 0,
+        done: std::collections::BTreeMap::new(),
+        stop: false,
+    });
+    // Workers wait for room in the window, the consumer for the next result.
+    let (room, ready) = (Condvar::new(), Condvar::new());
+    std::thread::scope(|s| {
+        for _ in 0..threads.min(n) {
+            s.spawn(|| {
+                loop {
+                    let mut st = state.lock().unwrap();
+                    while !st.stop && st.next < n && st.next - st.consumed >= ahead {
+                        st = room.wait(st).unwrap();
+                    }
+                    if st.stop || st.next >= n {
+                        return;
+                    }
+                    let i = st.next;
+                    st.next += 1;
+                    drop(st);
+                    let r = work(i);
+                    let mut st = state.lock().unwrap();
+                    st.stop |= r.is_err();
+                    st.done.insert(i, r);
+                    drop(st);
+                    ready.notify_one();
+                }
+            });
+        }
+        let mut run = || -> Result<()> {
+            for i in 0..n {
+                let mut st = state.lock().unwrap();
+                let r = loop {
+                    if let Some(r) = st.done.remove(&i) {
+                        break r;
+                    }
+                    st = ready.wait(st).unwrap();
+                };
+                st.consumed = i + 1;
+                drop(st);
+                room.notify_one();
+                consume(i, r?)?;
+            }
+            Ok(())
+        };
+        let result = run();
+        state.lock().unwrap().stop = true;
+        room.notify_all();
+        result
+    })
+}
+
 /// Runs a decoder on its own thread, a few chunks ahead of `f`, so
 /// decompression overlaps with whatever `f` does with the data.
 fn read_ahead<T>(mut r: impl Read + Send, f: impl FnOnce(&mut ChunkReader) -> T) -> T {

@@ -8,7 +8,6 @@ use crate::{
 use bzip2::read::MultiBzDecoder;
 use bzip2::write::BzEncoder;
 use flate2::read::MultiGzDecoder;
-use flate2::write::GzEncoder;
 use lzma_rust2::{LzipReader, LzmaReader, XzOptions, XzReader, XzReaderMt, XzWriter, XzWriterMt};
 use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
 use std::fs::{self, File};
@@ -16,6 +15,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex, mpsc};
 
 /// Refuse LZMA/XZ streams that need more than this much dictionary memory.
 const MEM_LIMIT_KB: u32 = 2 << 20; // 2 GiB
@@ -166,7 +166,7 @@ fn varint(buf: &[u8], at: &mut usize) -> Option<u64> {
 
 pub(crate) enum Encoder<W: Write> {
     Plain(W),
-    Gz(GzEncoder<W>),
+    Gz(ParDeflate<W>),
     Bz2(BzEncoder<W>),
     Xz(XzWriter<W>),
     XzMt(XzWriterMt<W>),
@@ -183,7 +183,10 @@ impl<W: Write> Encoder<W> {
         Ok(match format {
             Format::Tar => Encoder::Plain(w),
             Format::Gz | Format::TarGz => {
-                Encoder::Gz(GzEncoder::new(w, flate2::Compression::new(n)))
+                let mut w = w;
+                // gzip header: deflate, no name, no mtime, OS unknown (as flate2 writes it).
+                w.write_all(&[0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 255])?;
+                Encoder::Gz(ParDeflate::new(w, n))
             }
             Format::Bz2 | Format::TarBz2 => {
                 Encoder::Bz2(BzEncoder::new(w, bzip2::Compression::new(n.max(1))))
@@ -213,7 +216,12 @@ impl<W: Write> Encoder<W> {
     pub fn finish(self) -> Result<W> {
         Ok(match self {
             Encoder::Plain(w) => w,
-            Encoder::Gz(e) => e.finish()?,
+            Encoder::Gz(e) => {
+                let (mut w, crc, len) = e.finish()?;
+                w.write_all(&crc.to_le_bytes())?;
+                w.write_all(&(len as u32).to_le_bytes())?;
+                w
+            }
             Encoder::Bz2(e) => e.finish()?,
             Encoder::Xz(e) => e.finish()?,
             Encoder::XzMt(e) => e.finish()?,
@@ -239,6 +247,176 @@ impl<W: Write> Write for Encoder<W> {
             Encoder::Xz(w) => w.flush(),
             Encoder::XzMt(w) => w.flush(),
         }
+    }
+}
+
+/// Deflate on all cores, the way pigz does it: the input is cut into chunks,
+/// each compressed on its own with the previous 32 KiB as dictionary and
+/// ended with a sync flush, so the pieces join into one ordinary deflate
+/// stream (a few bytes larger per MiB than single-threaded).
+pub(crate) struct ParDeflate<W: Write> {
+    inner: W,
+    chunk: Vec<u8>,
+    /// The last 32 KiB before `chunk`.
+    dict: Vec<u8>,
+    crc: crc32fast::Hasher,
+    total_in: u64,
+    sent: u64,
+    written: u64,
+    done: std::collections::BTreeMap<u64, Vec<u8>>,
+    /// Dropping it (or the whole encoder) stops the threads.
+    jobs: Option<mpsc::SyncSender<DeflateJob>>,
+    results: mpsc::Receiver<(u64, io::Result<Vec<u8>>)>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    max_in_flight: u64,
+}
+
+struct DeflateJob {
+    id: u64,
+    data: Vec<u8>,
+    dict: Vec<u8>,
+    last: bool,
+}
+
+const DEFLATE_CHUNK: usize = 1 << 20;
+const DEFLATE_WINDOW: usize = 32 << 10;
+
+impl<W: Write> ParDeflate<W> {
+    pub fn new(inner: W, level: u32) -> Self {
+        let n = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let (jobs, rx) = mpsc::sync_channel::<DeflateJob>(n);
+        let (tx, results) = mpsc::channel();
+        let rx = Arc::new(Mutex::new(rx));
+        let threads = (0..n)
+            .map(|_| {
+                let (rx, tx) = (rx.clone(), tx.clone());
+                std::thread::spawn(move || {
+                    loop {
+                        // Own statement: the lock must not be held while compressing.
+                        let Ok(job) = rx.lock().unwrap().recv() else {
+                            return;
+                        };
+                        let out = deflate_chunk(&job, level);
+                        if tx.send((job.id, out)).is_err() {
+                            return;
+                        }
+                    }
+                })
+            })
+            .collect();
+        Self {
+            inner,
+            chunk: Vec::with_capacity(DEFLATE_CHUNK),
+            dict: Vec::new(),
+            crc: crc32fast::Hasher::new(),
+            total_in: 0,
+            sent: 0,
+            written: 0,
+            done: Default::default(),
+            jobs: Some(jobs),
+            results,
+            threads,
+            max_in_flight: 2 * n as u64,
+        }
+    }
+
+    fn dispatch(&mut self, last: bool) -> io::Result<()> {
+        let data = std::mem::replace(&mut self.chunk, Vec::with_capacity(DEFLATE_CHUNK));
+        let dict = std::mem::take(&mut self.dict);
+        let mut next = if data.len() >= DEFLATE_WINDOW {
+            Vec::new()
+        } else {
+            dict.clone()
+        };
+        next.extend_from_slice(&data[data.len().saturating_sub(DEFLATE_WINDOW)..]);
+        self.dict = next[next.len().saturating_sub(DEFLATE_WINDOW)..].to_vec();
+        let job = DeflateJob {
+            id: self.sent,
+            data,
+            dict,
+            last,
+        };
+        self.sent += 1;
+        let sent = self.jobs.as_ref().is_some_and(|j| j.send(job).is_ok());
+        if !sent {
+            return Err(io::Error::other("deflate threads stopped"));
+        }
+        self.collect(self.max_in_flight)
+    }
+
+    /// Writes finished chunks in order until at most `outstanding` are left.
+    fn collect(&mut self, outstanding: u64) -> io::Result<()> {
+        loop {
+            while let Some(out) = self.done.remove(&self.written) {
+                self.inner.write_all(&out)?;
+                self.written += 1;
+            }
+            if self.sent - self.written <= outstanding {
+                return Ok(());
+            }
+            let (id, out) = self
+                .results
+                .recv()
+                .map_err(|_| io::Error::other("deflate threads stopped"))?;
+            self.done.insert(id, out?);
+        }
+    }
+
+    /// `(inner, crc32 of the input, input length)`.
+    pub fn finish(mut self) -> io::Result<(W, u32, u64)> {
+        self.dispatch(true)?;
+        self.collect(0)?;
+        self.jobs = None;
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+        let crc = std::mem::take(&mut self.crc).finalize();
+        Ok((self.inner, crc, self.total_in))
+    }
+}
+
+fn deflate_chunk(job: &DeflateJob, level: u32) -> io::Result<Vec<u8>> {
+    use flate2::{Compress, Compression, FlushCompress, Status};
+    let mut c = Compress::new(Compression::new(level), false);
+    if !job.dict.is_empty() {
+        c.set_dictionary(&job.dict).map_err(io::Error::other)?;
+    }
+    let flush = if job.last {
+        FlushCompress::Finish
+    } else {
+        FlushCompress::Sync
+    };
+    let mut out = Vec::with_capacity(job.data.len() / 2 + 4096);
+    loop {
+        if out.capacity() - out.len() < 1024 {
+            out.reserve(out.capacity());
+        }
+        let pos = c.total_in() as usize;
+        let status = c
+            .compress_vec(&job.data[pos..], &mut out, flush)
+            .map_err(io::Error::other)?;
+        let all_in = c.total_in() as usize == job.data.len();
+        match status {
+            Status::StreamEnd => return Ok(out),
+            _ if !job.last && all_in && out.len() < out.capacity() => return Ok(out),
+            _ => {}
+        }
+    }
+}
+
+impl<W: Write> Write for ParDeflate<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = buf.len().min(DEFLATE_CHUNK - self.chunk.len());
+        self.chunk.extend_from_slice(&buf[..n]);
+        self.crc.update(&buf[..n]);
+        self.total_in += n as u64;
+        if self.chunk.len() == DEFLATE_CHUNK {
+            self.dispatch(false)?;
+        }
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -379,7 +557,7 @@ mod tests {
     #[test]
     fn decodes_multi_block_xz_in_parallel_only_when_the_index_checks_out() {
         let data: Vec<u8> = (0..12_000_000u32)
-            .map(|i| (i % 251 ^ i >> 12) as u8)
+            .map(|i| ((i % 251) ^ (i >> 12)) as u8)
             .collect();
         let mut opts = XzOptions::with_preset(1);
         opts.set_block_size(NonZeroU64::new(3 << 20));

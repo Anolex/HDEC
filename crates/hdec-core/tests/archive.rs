@@ -1290,3 +1290,57 @@ fn duplicate_names_follow_the_overwrite_policy() {
         );
     }
 }
+
+#[test]
+fn zip_big_files_deflate_in_parallel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("big");
+    fs::create_dir(&src).unwrap();
+    // Over the parallel-entry limit, compressible, and not chunk-aligned.
+    let data: Vec<u8> = (0..20_000_003u32)
+        .map(|i| ((i % 1009) ^ (i >> 11)) as u8)
+        .collect();
+    fs::write(src.join("data.bin"), &data).unwrap();
+    let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_400_000_000);
+    let f = fs::File::options()
+        .write(true)
+        .open(src.join("data.bin"))
+        .unwrap();
+    f.set_modified(old).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(fs::Permissions::from_mode(0o750))
+            .unwrap();
+    }
+    drop(f);
+    let cancel = AtomicBool::new(false);
+    let c = ctx(None, &cancel);
+    for level in [Level::Fast, Level::Normal] {
+        let archive = tmp.path().join(format!("{level:?}.zip"));
+        let opts = CreateOptions {
+            format: Format::Zip,
+            level,
+            ..Default::default()
+        };
+        hdec_core::create(std::slice::from_ref(&src), &archive, &opts, &c).unwrap();
+        assert!(fs::metadata(&archive).unwrap().len() < data.len() as u64 / 2);
+        hdec_core::test(&archive, &c).unwrap();
+        let out = tmp.path().join(format!("out-{level:?}"));
+        extract(&archive, &out, None).unwrap();
+        let got = out.join("big/data.bin");
+        assert!(fs::read(&got).unwrap() == data);
+        let meta = fs::metadata(&got).unwrap();
+        let drift = meta
+            .modified()
+            .unwrap()
+            .duration_since(old)
+            .unwrap_or_default();
+        assert!(drift < Duration::from_secs(3));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(meta.permissions().mode() & 0o777, 0o750);
+        }
+    }
+}

@@ -4,14 +4,14 @@ use crate::{CreateOptions, Ctx, Edit, Entry, Error, ExtractOptions, Level, Meter
 use jiff::tz::TimeZone;
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 use zip::result::ZipError;
 use zip::unstable::write::FileOptionsExt;
-use zip::write::SimpleFileOptions;
+use zip::write::{FileOptions, SimpleFileOptions};
 use zip::{AesMode, CompressionMethod, ZipArchive, ZipWriter};
 
 type Archive = ZipArchive<BufReader<Volume>>;
@@ -258,6 +258,11 @@ fn finish(w: Writer) -> Result<()> {
     out.commit()
 }
 
+/// Files up to this size are compressed whole on worker threads (each into a
+/// one-entry archive in memory, then raw-copied in order); bigger ones are
+/// split across all cores by `deflate_big`. Bounds memory: 16 per thread wait.
+const PARALLEL_MAX: u64 = 1 << 20;
+
 fn add_items(
     w: &mut Writer,
     items: &[hfs::Source],
@@ -265,7 +270,7 @@ fn add_items(
     opts: &CreateOptions,
     ctx: &Ctx,
 ) -> Result<()> {
-    let mut meter = Meter::new(
+    let meter = Meter::new(
         ctx,
         items
             .iter()
@@ -273,47 +278,172 @@ fn add_items(
             .map(|s| s.meta.len())
             .sum(),
     );
-    let base = match opts.level {
-        Level::Store => SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
-        level => SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Deflated)
-            .compression_level(Some(match level {
-                Level::Fast => 1,
-                Level::Normal => 6,
-                _ => 9,
-            })),
+    let deflate_level = match opts.level {
+        Level::Store => None,
+        Level::Fast => Some(1),
+        Level::Normal => Some(6),
+        Level::Max => Some(9),
     };
-    for item in items {
+    let base = match deflate_level {
+        None => SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        Some(n) => SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .compression_level(Some(n.into())),
+    };
+    let entry_options =
+        |item: &hfs::Source| entry_options(base, item, ctx.password, opts.zip_crypto);
+    // ZipCrypto entries don't survive `raw_copy_file` (zip 9.0.1): legacy, so serial.
+    let parallel = |item: &hfs::Source| {
+        !opts.zip_crypto && item.meta.is_file() && item.meta.len() <= PARALLEL_MAX
+    };
+    let compress = |i: usize| -> Result<Option<Vec<u8>>> {
+        let item = &items[i];
+        if !parallel(item) {
+            return Ok(None);
+        }
         ctx.check()?;
         let name = format!("{prefix}{}", item.name);
-        let mut o = base.last_modified_time(
-            item.meta
-                .modified()
-                .ok()
-                .and_then(to_dos)
-                .unwrap_or_default(),
-        );
-        if let Some(mode) = hfs::mode(&item.meta) {
-            o = o.unix_permissions(mode);
+        let mut one = ZipWriter::new(io::Cursor::new(Vec::with_capacity(
+            item.meta.len() as usize / 2 + 256,
+        )));
+        one.start_file(&name, entry_options(item)?)?;
+        let mut file = File::open(&item.path)?;
+        meter.fork().copy(&name, &mut file, &mut one)?;
+        Ok(Some(one.finish()?.into_inner()))
+    };
+    let threads = all_cores();
+    let mut own = meter.fork();
+    let write = |i: usize, packed: Option<Vec<u8>>| -> Result<()> {
+        let item = &items[i];
+        let name = format!("{prefix}{}", item.name);
+        if let Some(bytes) = packed {
+            let mut one = ZipArchive::new(io::Cursor::new(bytes))?;
+            return Ok(w.raw_copy_file(one.by_index_raw(0)?)?);
         }
-        if let Some(password) = ctx.password {
-            o = if opts.zip_crypto {
-                o.with_deprecated_encryption(password.as_bytes())?
-            } else {
-                o.with_aes_encryption(AesMode::Aes256, password)
-            };
-        }
+        let o = entry_options(item)?;
         if item.meta.is_dir() {
             w.add_directory(&name, o)?;
         } else if item.meta.is_symlink() {
             let target = std::fs::read_link(&item.path)?;
             w.add_symlink(&name, target.to_string_lossy(), o)?;
+        } else if let (Some(level), None) = (deflate_level, ctx.password) {
+            let one = deflate_big(item, &name, level, &mut own)?;
+            w.raw_copy_file(ZipArchive::new(one)?.by_index_raw(0)?)?;
         } else {
-            w.start_file(&name, o.large_file(item.meta.len() >= u32::MAX as u64))?;
-            meter.copy(&name, &mut File::open(&item.path)?, w)?;
+            w.start_file(&name, o)?;
+            own.copy(&name, &mut File::open(&item.path)?, w)?;
         }
+        Ok(())
+    };
+    crate::ordered_parallel(items.len(), threads, 16 * threads, compress, write)
+}
+
+/// Deflates a big file on all cores into a one-entry ZIP64 archive in a temp
+/// file, ready for `raw_copy_file` (the zip crate can't take pre-compressed data).
+fn deflate_big(item: &hfs::Source, name: &str, level: u32, meter: &mut Meter) -> Result<File> {
+    let dos = item
+        .meta
+        .modified()
+        .ok()
+        .and_then(to_dos)
+        .unwrap_or_default();
+    let (made_by, external): (u16, u32) = match hfs::mode(&item.meta) {
+        Some(mode) => ((3 << 8) | 45, (0o100000 | mode) << 16),
+        None => (45, 0),
+    };
+    // Version 4.5 (ZIP64), UTF-8 name, deflate.
+    let common = |crc: u32| {
+        let mut h = Vec::new();
+        for v in [45u16, 0x0800, 8, dos.timepart(), dos.datepart()] {
+            h.extend_from_slice(&v.to_le_bytes());
+        }
+        h.extend_from_slice(&crc.to_le_bytes());
+        h.extend_from_slice(&[0xFF; 8]); // sizes: see the ZIP64 field
+        h.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        h.extend_from_slice(&20u16.to_le_bytes());
+        h
+    };
+    let zip64 = |size: u64, packed: u64| {
+        let mut e = vec![1, 0, 16, 0];
+        e.extend_from_slice(&size.to_le_bytes());
+        e.extend_from_slice(&packed.to_le_bytes());
+        e
+    };
+    let local = |crc, size, packed| {
+        let mut h = 0x04034b50u32.to_le_bytes().to_vec();
+        h.extend(common(crc));
+        h.extend_from_slice(name.as_bytes());
+        h.extend(zip64(size, packed));
+        h
+    };
+    let mut tmp = tempfile::tempfile()?;
+    let header_len = local(0, 0, 0).len() as u64;
+    tmp.write_all(&local(0, 0, 0))?;
+    let mut enc = super::stream::ParDeflate::new(BufWriter::new(&tmp), level);
+    meter.copy(name, &mut File::open(&item.path)?, &mut enc)?;
+    let (out, crc, size) = enc.finish()?;
+    out.into_inner().map_err(|e| e.into_error())?;
+    let packed = tmp.seek(SeekFrom::End(0))? - header_len;
+    tmp.seek(SeekFrom::Start(0))?;
+    tmp.write_all(&local(crc, size, packed))?;
+    tmp.seek(SeekFrom::End(0))?;
+
+    let mut tail = 0x02014b50u32.to_le_bytes().to_vec();
+    tail.extend_from_slice(&made_by.to_le_bytes());
+    tail.extend(common(crc));
+    tail.extend_from_slice(&[0; 6]); // comment length, disk, internal attributes
+    tail.extend_from_slice(&external.to_le_bytes());
+    tail.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+    tail.extend_from_slice(name.as_bytes());
+    tail.extend(zip64(size, packed));
+    let (cd_offset, cd_size) = (header_len + packed, tail.len() as u64);
+    let eocd64 = cd_offset + cd_size;
+    tail.extend_from_slice(&0x06064b50u32.to_le_bytes());
+    tail.extend_from_slice(&44u64.to_le_bytes());
+    for v in [made_by, 45] {
+        tail.extend_from_slice(&v.to_le_bytes());
     }
-    Ok(())
+    tail.extend_from_slice(&[0; 8]); // disk numbers
+    for v in [1, 1, cd_size, cd_offset] {
+        tail.extend_from_slice(&u64::to_le_bytes(v));
+    }
+    tail.extend_from_slice(&0x07064b50u32.to_le_bytes());
+    tail.extend_from_slice(&0u32.to_le_bytes());
+    tail.extend_from_slice(&eocd64.to_le_bytes());
+    tail.extend_from_slice(&1u32.to_le_bytes());
+    tail.extend_from_slice(&0x06054b50u32.to_le_bytes());
+    tail.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
+    tail.extend_from_slice(&[0xFF; 8]); // CD size and offset: see ZIP64
+    tail.extend_from_slice(&[0, 0]);
+    tmp.write_all(&tail)?;
+    tmp.seek(SeekFrom::Start(0))?;
+    Ok(tmp)
+}
+
+fn entry_options<'k>(
+    base: SimpleFileOptions,
+    item: &hfs::Source,
+    password: Option<&'k str>,
+    zip_crypto: bool,
+) -> Result<FileOptions<'k, 'static, ()>> {
+    let mut o: FileOptions<'k, 'static, ()> = base.last_modified_time(
+        item.meta
+            .modified()
+            .ok()
+            .and_then(to_dos)
+            .unwrap_or_default(),
+    );
+    if let Some(mode) = hfs::mode(&item.meta) {
+        o = o.unix_permissions(mode);
+    }
+    if let Some(password) = password {
+        o = if zip_crypto {
+            o.with_deprecated_encryption(password.as_bytes())?
+        } else {
+            o.with_aes_encryption(AesMode::Aes256, password)
+        };
+    }
+    Ok(o.large_file(item.meta.len() >= u32::MAX as u64))
 }
 
 /// Copies unchanged entries raw (no recompression, encryption kept), then adds new ones.
