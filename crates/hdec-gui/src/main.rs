@@ -1,6 +1,8 @@
 // No console window behind the GUI on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS uses the native panel
+mod picker;
 mod theme;
 
 use eframe::egui::{self, Align, Key, Layout, Margin, RichText, Sense, vec2};
@@ -136,6 +138,16 @@ struct CreateForm {
     show: bool,
     split: bool,
     split_mb: String,
+    /// Set by the Add… button; the app opens the picker for it.
+    add_more: bool,
+}
+
+/// What picked files and folders are for.
+#[derive(Clone, Copy)]
+enum PickFor {
+    New,
+    Add,
+    Contents,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -156,8 +168,7 @@ enum Command {
     Rename,
     Delete,
     NewFolder,
-    AddFiles,
-    AddFolder,
+    Add,
     /// Move entries into a folder ("" = root).
     Move(Vec<String>, String),
 }
@@ -197,6 +208,8 @@ struct App {
     opened: Vec<OpenedFile>,
     /// Why the open archive can't be edited, if it can't.
     read_only: Option<&'static str>,
+    /// In-app files-and-folders picker (Windows; macOS uses the native one).
+    picker: Option<(picker::Picker, PickFor)>,
 }
 
 struct OpenedFile {
@@ -441,12 +454,39 @@ impl App {
             show: false,
             split: false,
             split_mb: "100".into(),
+            add_more: false,
         });
     }
 
-    fn new_menu(&mut self, ui: &mut egui::Ui) {
-        if let Some(sources) = pick_sources(ui) {
-            self.new_archive(sources);
+    /// Asks for files and folders in one dialog: double-click opens a folder,
+    /// Open takes the selection, folders included.
+    fn pick(&mut self, ctx: &egui::Context, purpose: PickFor) {
+        #[cfg(target_os = "macos")]
+        if let Some(paths) = rfd::FileDialog::new().pick_files_or_folders() {
+            self.picked(ctx, purpose, paths);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = ctx;
+            let start = self
+                .archive
+                .as_deref()
+                .and_then(Path::parent)
+                .map_or_else(picker::home, Path::to_path_buf);
+            self.picker = Some((picker::Picker::new(start), purpose));
+        }
+    }
+
+    fn picked(&mut self, ctx: &egui::Context, purpose: PickFor, paths: Vec<PathBuf>) {
+        match purpose {
+            PickFor::New => self.new_archive(paths),
+            PickFor::Add if self.modifiable => self.add(ctx, paths),
+            PickFor::Add => {}
+            PickFor::Contents => {
+                if let Dialog::Create(form) = &mut self.dialog {
+                    add_sources(&mut form.sources, paths);
+                }
+            }
         }
     }
 
@@ -532,16 +572,7 @@ impl App {
                     .unwrap();
                 self.dialog = Dialog::NewFolder(name);
             }
-            Command::AddFiles if self.modifiable => {
-                if let Some(files) = rfd::FileDialog::new().pick_files() {
-                    self.add(ctx, files);
-                }
-            }
-            Command::AddFolder if self.modifiable => {
-                if let Some(dirs) = rfd::FileDialog::new().pick_folders() {
-                    self.add(ctx, dirs);
-                }
-            }
+            Command::Add if self.modifiable => self.pick(ctx, PickFor::Add),
             Command::Move(paths, into) if self.modifiable => {
                 let pairs: Vec<(String, String)> = paths
                     .into_iter()
@@ -642,8 +673,9 @@ impl App {
             {
                 self.open(ui.ctx(), p);
             }
-            let new = theme::tool_button(ui, icon::PLUS_SQUARE, "New", idle, false);
-            egui::Popup::menu(&new).show(|ui| self.new_menu(ui));
+            if theme::tool_button(ui, icon::PLUS_SQUARE, "New", idle, false).clicked() {
+                self.pick(ui.ctx(), PickFor::New);
+            }
             theme::tool_separator(ui);
             if theme::tool_button(ui, icon::EXPORT, "Extract", has, true).clicked() {
                 self.start_extract();
@@ -657,24 +689,17 @@ impl App {
                 Some(reason) => r.on_hover_text(reason),
                 None => r,
             };
-            let add = why(theme::tool_button(
+            if why(theme::tool_button(
                 ui,
                 icon::FILE_PLUS,
                 "Add",
                 can_edit,
                 false,
-            ));
-            egui::Popup::menu(&add).show(|ui| {
-                if ui.button(format!("{}  Files…", icon::FILE_PLUS)).clicked() {
-                    self.command(ui.ctx(), Command::AddFiles);
-                }
-                if ui
-                    .button(format!("{}  Folders…", icon::FOLDER_PLUS))
-                    .clicked()
-                {
-                    self.command(ui.ctx(), Command::AddFolder);
-                }
-            });
+            ))
+            .clicked()
+            {
+                self.command(ui.ctx(), Command::Add);
+            }
             if why(theme::tool_button(
                 ui,
                 icon::FOLDER_PLUS,
@@ -1125,17 +1150,8 @@ impl App {
                     {
                         action = Some(Command::NewFolder);
                     }
-                    if ui
-                        .button(format!("{}  Add files…", icon::FILE_PLUS))
-                        .clicked()
-                    {
-                        action = Some(Command::AddFiles);
-                    }
-                    if ui
-                        .button(format!("{}  Add folders…", icon::FOLDER_PLUS))
-                        .clicked()
-                    {
-                        action = Some(Command::AddFolder);
+                    if ui.button(format!("{}  Add…", icon::FILE_PLUS)).clicked() {
+                        action = Some(Command::Add);
                     }
                 });
             }
@@ -1178,8 +1194,10 @@ impl App {
                     {
                         self.open(ui.ctx(), p);
                     }
-                    let new = theme::button(ui, &format!("{}  New archive…", icon::PLUS_SQUARE));
-                    egui::Popup::menu(&new).show(|ui| self.new_menu(ui));
+                    if theme::button(ui, &format!("{}  New archive…", icon::PLUS_SQUARE)).clicked()
+                    {
+                        self.pick(ui.ctx(), PickFor::New);
+                    }
                 });
                 ui.add_space(14.0);
                 ui.label(
@@ -1339,6 +1357,7 @@ impl App {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
+        let mut pick_contents = false;
         let dialog = std::mem::take(&mut self.dialog);
         self.dialog = match dialog {
             Dialog::None => Dialog::None,
@@ -1607,6 +1626,7 @@ impl App {
                     theme::dialog(ctx, icon::PLUS_SQUARE, "New archive", &subtitle, |ui| {
                         create_form(ui, &mut form)
                     });
+                pick_contents = std::mem::take(&mut form.add_more);
                 match result {
                     Some(true) => {
                         self.create(ctx, form);
@@ -1617,6 +1637,22 @@ impl App {
                 }
             }
         };
+        if pick_contents {
+            self.pick(ctx, PickFor::Contents);
+        }
+        if let Some((picker, purpose)) = &mut self.picker {
+            let title = match purpose {
+                PickFor::New => "New archive from…",
+                PickFor::Add | PickFor::Contents => "Add files and folders",
+            };
+            if let Some(picked) = picker.show(ctx, title) {
+                let purpose = *purpose;
+                self.picker = None;
+                if let picker::Picked::Open(paths) = picked {
+                    self.picked(ctx, purpose, paths);
+                }
+            }
+        }
     }
 }
 
@@ -1635,11 +1671,7 @@ impl eframe::App for App {
         if !dropped.is_empty() && self.job.is_none() {
             match dropped.as_slice() {
                 _ if let Dialog::Create(form) = &mut self.dialog => {
-                    for src in dropped {
-                        if !form.sources.contains(&src) {
-                            form.sources.push(src);
-                        }
-                    }
+                    add_sources(&mut form.sources, dropped)
                 }
                 // An editable archive is open: everything dropped goes into it.
                 _ if self.modifiable => self.add(&ctx, dropped),
@@ -1736,20 +1768,6 @@ fn password_field(ui: &mut egui::Ui, value: &mut String, show: &mut bool, focus:
     .inner
 }
 
-/// "Files…" / "Folders…" menu entries. Folders go in with everything inside them.
-fn pick_sources(ui: &mut egui::Ui) -> Option<Vec<PathBuf>> {
-    if ui.button(format!("{}  Files…", icon::FILE_PLUS)).clicked() {
-        return rfd::FileDialog::new().pick_files();
-    }
-    if ui
-        .button(format!("{}  Folders…", icon::FOLDER_PLUS))
-        .clicked()
-    {
-        return rfd::FileDialog::new().pick_folders();
-    }
-    None
-}
-
 fn path_field(ui: &mut egui::Ui, value: &mut String, browse: impl FnOnce() -> Option<PathBuf>) {
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(value).desired_width(ui.available_width() - 82.0));
@@ -1770,7 +1788,7 @@ fn create_form(ui: &mut egui::Ui, form: &mut CreateForm) -> Option<bool> {
         .spacing(vec2(12.0, 10.0))
         .show(ui, |ui| {
             theme::form_label(ui, "Contents");
-            sources_list(ui, &mut form.sources);
+            form.add_more |= sources_list(ui, &mut form.sources);
             ui.end_row();
 
             theme::form_label(ui, "Save as");
@@ -1899,7 +1917,8 @@ fn create_form(ui: &mut egui::Ui, form: &mut CreateForm) -> Option<bool> {
 }
 
 /// What goes into a new archive: removable rows, plus a button to add more.
-fn sources_list(ui: &mut egui::Ui, sources: &mut Vec<PathBuf>) {
+/// Returns true when Add… was clicked.
+fn sources_list(ui: &mut egui::Ui, sources: &mut Vec<PathBuf>) -> bool {
     let p = pal(ui.ctx());
     let width = ui.available_width();
     ui.vertical(|ui| {
@@ -1943,15 +1962,18 @@ fn sources_list(ui: &mut egui::Ui, sources: &mut Vec<PathBuf>) {
         if let Some(i) = remove {
             sources.remove(i);
         }
-        let add = ui.add(egui::Button::new(format!("{}  Add…", icon::PLUS)).small());
-        egui::Popup::menu(&add).show(|ui| {
-            for src in pick_sources(ui).unwrap_or_default() {
-                if !sources.contains(&src) {
-                    sources.push(src);
-                }
-            }
-        });
-    });
+        ui.add(egui::Button::new(format!("{}  Add…", icon::PLUS)).small())
+            .clicked()
+    })
+    .inner
+}
+
+fn add_sources(sources: &mut Vec<PathBuf>, paths: Vec<PathBuf>) {
+    for path in paths {
+        if !sources.contains(&path) {
+            sources.push(path);
+        }
+    }
 }
 
 /// Accepts a dropped `Dragged` payload on `response`, highlighting it while hovered.
@@ -2384,7 +2406,7 @@ mod tests {
             app.navigate("tree/sub".into());
             app.selected.insert("tree/sub/b.txt".into());
         };
-        let states: [(&str, Setup); 10] = [
+        let states: [(&str, Setup); 11] = [
             ("saveback", |app, ctx, path, entries| {
                 app.finish(ctx, Outcome::Opened(path.to_path_buf(), entries.to_vec()));
                 app.dialog = Dialog::SaveBack {
@@ -2444,6 +2466,16 @@ mod tests {
                     retry: None,
                     password: None,
                 });
+            }),
+            ("picker", |app, _, path, _| {
+                let dir = path
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap();
+                app.picker = Some((picker::Picker::new(dir), PickFor::Add));
             }),
             ("filter", |app, ctx, path, entries| {
                 app.finish(ctx, Outcome::Opened(path.to_path_buf(), entries.to_vec()));

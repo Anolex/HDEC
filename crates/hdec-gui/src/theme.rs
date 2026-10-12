@@ -279,6 +279,19 @@ pub fn dialog<R>(
     subtitle: &str,
     body: impl FnOnce(&mut Ui) -> R,
 ) -> R {
+    dialog_with(ctx, "dialog", 440.0, icon, title, subtitle, body)
+}
+
+/// `dialog` with its own id (so it can stack on another dialog) and width.
+pub fn dialog_with<R>(
+    ctx: &egui::Context,
+    id: &str,
+    width: f32,
+    icon: &str,
+    title: &str,
+    subtitle: &str,
+    body: impl FnOnce(&mut Ui) -> R,
+) -> R {
     let p = pal(ctx);
     let frame = Frame::new()
         .fill(p.panel)
@@ -291,10 +304,10 @@ pub fn dialog<R>(
             spread: 0,
             color: Color32::from_black_alpha(110),
         });
-    egui::Modal::new(egui::Id::new("dialog"))
+    egui::Modal::new(egui::Id::new(id))
         .frame(frame)
         .show(ctx, |ui| {
-            ui.set_width(440.0);
+            ui.set_width(width);
             ui.horizontal(|ui| {
                 ui.label(RichText::new(icon).size(20.0).color(p.accent));
                 ui.label(RichText::new(title).size(15.0).strong().color(p.text));
