@@ -74,7 +74,7 @@ impl Picker {
     /// Draws the picker; returns the outcome once the user is done.
     pub fn show(&mut self, ctx: &egui::Context, title: &str) -> Option<Picked> {
         let p = pal(ctx);
-        theme::dialog_with(ctx, "picker", 620.0, icon::PLUS_SQUARE, title, "", |ui| {
+        theme::dialog_with(ctx, "picker", 560.0, icon::PLUS_SQUARE, title, "", |ui| {
             let mut go = None;
             let mut result = None;
             ui.horizontal(|ui| {
@@ -114,8 +114,8 @@ impl Picker {
                         .id_salt(&self.dir)
                         .sense(Sense::click())
                         .cell_layout(Layout::left_to_right(Align::Center))
-                        .min_scrolled_height(320.0)
-                        .max_scroll_height(320.0)
+                        .min_scrolled_height(220.0)
+                        .max_scroll_height(220.0)
                         .auto_shrink(false)
                         .column(Column::remainder().clip(true))
                         .column(Column::exact(86.0))

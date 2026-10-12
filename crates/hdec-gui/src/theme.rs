@@ -326,7 +326,12 @@ pub fn dialog_footer(ui: &mut Ui, buttons: impl FnOnce(&mut Ui)) {
     ui.add_space(6.0);
     ui.separator();
     ui.add_space(2.0);
-    ui.with_layout(Layout::right_to_left(Align::Center), buttons);
+    // A bounded height: a bare right-to-left layout would fill the whole modal.
+    ui.allocate_ui_with_layout(
+        vec2(ui.available_width(), 30.0),
+        Layout::right_to_left(Align::Center),
+        buttons,
+    );
 }
 
 /// Icon for a file, by extension.

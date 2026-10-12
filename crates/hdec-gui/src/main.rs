@@ -35,13 +35,16 @@ fn fits(format: Format, sources: &[PathBuf]) -> bool {
         || matches!(sources, [one] if one.is_file())
 }
 
+/// Default window size.
+const WINDOW: [f32; 2] = [728.0, 448.0];
+
 fn main() -> eframe::Result {
     let mut app = App::default();
     let path = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1040.0, 640.0])
-            .with_min_inner_size([640.0, 360.0]),
+            .with_inner_size(WINDOW)
+            .with_min_inner_size([560.0, 340.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -78,6 +81,7 @@ enum Outcome {
     Tested,
     Created(PathBuf),
     Modified,
+    Saved,
     Previewed { entry: String, file: PathBuf },
 }
 
@@ -125,11 +129,29 @@ enum Dialog {
         overwrite: Overwrite,
     },
     Create(CreateForm),
+    /// Edits aren't saved yet; ask before doing `Then`.
+    Unsaved(Then),
+}
+
+/// What to do once unsaved edits are saved or discarded.
+enum Then {
+    Open(PathBuf),
+    Close,
+}
+
+/// Edits go into a copy of the archive; Save writes it back.
+struct Working {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+    dirty: bool,
 }
 
 struct CreateForm {
     sources: Vec<PathBuf>,
-    dest: String,
+    /// Archive file name; the format's extension is added if missing.
+    name: String,
+    /// Folder the archive is saved in.
+    folder: String,
     format: Format,
     level: Level,
     zip_crypto: bool,
@@ -140,6 +162,19 @@ struct CreateForm {
     split_mb: String,
     /// Set by the Add… button; the app opens the picker for it.
     add_more: bool,
+}
+
+impl CreateForm {
+    fn dest(&self) -> PathBuf {
+        let name = self.name.trim();
+        let ext = format!(".{}", self.format.extension());
+        let file = if name.to_lowercase().ends_with(&ext) {
+            name.to_owned()
+        } else {
+            format!("{name}{ext}")
+        };
+        Path::new(self.folder.trim()).join(file)
+    }
 }
 
 /// What picked files and folders are for.
@@ -210,6 +245,11 @@ struct App {
     read_only: Option<&'static str>,
     /// In-app files-and-folders picker (Windows; macOS uses the native one).
     picker: Option<(picker::Picker, PickFor)>,
+    working: Option<Working>,
+    /// Runs after a successful save.
+    after_save: Option<Then>,
+    /// The user chose to quit; let the close request through.
+    closing: bool,
 }
 
 struct OpenedFile {
@@ -220,7 +260,36 @@ struct OpenedFile {
 
 impl App {
     fn run(&mut self, ctx: &egui::Context, action: Action, password: Password) {
-        let archive = self.archive.clone();
+        let mut seed = None;
+        if matches!(action, Action::Modify(_)) {
+            if self.working.is_none() {
+                let original = self.archive.as_deref().unwrap();
+                match tempfile::Builder::new().prefix("hdec-edit").tempdir() {
+                    Ok(dir) => {
+                        let path = dir.path().join(original.file_name().unwrap());
+                        self.working = Some(Working {
+                            _dir: dir,
+                            path,
+                            dirty: false,
+                        });
+                    }
+                    Err(e) => {
+                        self.dialog = Dialog::Error(format!("Couldn't make a working copy: {e}"));
+                        return;
+                    }
+                }
+            }
+            let work = &self.working.as_ref().unwrap().path;
+            if !work.exists() {
+                seed = Some((self.archive.clone().unwrap(), work.clone()));
+            }
+        }
+        // Everything reads the working copy when there is one: that's what's on screen.
+        let archive = self
+            .working
+            .as_ref()
+            .map(|w| w.path.clone())
+            .or(self.archive.clone());
         let (verb, icon) = match &action {
             Action::Open(_) => ("Opening", icon::FOLDER_OPEN),
             Action::Extract(..) => ("Extracting", icon::EXPORT),
@@ -242,6 +311,9 @@ impl App {
                 hdec_core::test(archive.as_deref().unwrap(), c).map(|_| Outcome::Tested)
             }
             Action::Modify(edit) => {
+                if let Some((original, work)) = seed {
+                    std::fs::copy(original, work)?;
+                }
                 hdec_core::modify(archive.as_deref().unwrap(), &edit, c).map(|_| Outcome::Modified)
             }
             Action::Preview { entry, dir } => {
@@ -321,17 +393,26 @@ impl App {
                     show: false,
                 };
             }
-            Err(Error::Cancelled) => self.status = "Cancelled".into(),
-            Err(e) => self.dialog = Dialog::Error(e.to_string()),
+            Err(Error::Cancelled) => {
+                self.after_save = None;
+                self.status = "Cancelled".into();
+            }
+            Err(e) => {
+                self.after_save = None;
+                self.dialog = Dialog::Error(e.to_string());
+            }
         }
     }
 
     fn finish(&mut self, ctx: &egui::Context, outcome: Outcome) {
         match outcome {
             Outcome::Opened(path, entries) => {
+                // The working copy stands in for the archive it was copied from.
+                let path = match &self.working {
+                    Some(w) if w.path == path => self.archive.clone().unwrap(),
+                    _ => path,
+                };
                 self.format = hdec_core::detect(&path).map(Format::name).unwrap_or("?");
-                let title = path.file_name().unwrap_or_default().to_string_lossy();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{title} — HDEC")));
                 let reopened = self.archive.as_ref() == Some(&path);
                 self.modifiable = hdec_core::modifiable(&path);
                 self.read_only = (!self.modifiable).then(|| read_only_reason(&path, self.format));
@@ -339,6 +420,7 @@ impl App {
                 self.any_encrypted = entries.iter().any(|e| e.encrypted);
                 self.dirs = dir_tree(&entries);
                 self.archive = Some(path);
+                self.update_title(ctx);
                 self.entries = entries;
                 if !reopened {
                     self.status.clear();
@@ -365,8 +447,18 @@ impl App {
             Outcome::Tested => self.dialog = Dialog::Info("No errors found.".into()),
             Outcome::Created(path) => self.open(ctx, path),
             Outcome::Modified => {
-                let path = self.archive.clone().unwrap();
+                let work = self.working.as_mut().unwrap();
+                work.dirty = true;
+                let path = work.path.clone();
                 self.run(ctx, Action::Open(path), self.password.clone());
+            }
+            Outcome::Saved => {
+                self.working = None;
+                self.status = "Saved".into();
+                self.update_title(ctx);
+                if let Some(then) = self.after_save.take() {
+                    self.proceed(ctx, then);
+                }
             }
             Outcome::Previewed { entry, file } => match launch(&file) {
                 Ok(()) => {
@@ -386,8 +478,54 @@ impl App {
     }
 
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if self.dirty() {
+            self.dialog = Dialog::Unsaved(Then::Open(path));
+            return;
+        }
+        self.working = None;
         self.password = None;
         self.run(ctx, Action::Open(path), None);
+    }
+
+    fn dirty(&self) -> bool {
+        self.working.as_ref().is_some_and(|w| w.dirty)
+    }
+
+    fn update_title(&self, ctx: &egui::Context) {
+        let Some(archive) = &self.archive else { return };
+        let name = archive.file_name().unwrap_or_default().to_string_lossy();
+        let edited = if self.dirty() { " (edited)" } else { "" };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+            "{name}{edited} — HDEC"
+        )));
+    }
+
+    /// Writes the working copy over the archive (via `*.hdec-tmp` + rename).
+    fn save(&mut self, ctx: &egui::Context) {
+        let Some(work) = self.working.as_ref().filter(|w| w.dirty) else {
+            return;
+        };
+        let (from, to) = (work.path.clone(), self.archive.clone().unwrap());
+        self.spawn(ctx, "Saving", icon::FLOPPY_DISK, None, None, move |_| {
+            let mut tmp = to.clone().into_os_string();
+            tmp.push(".hdec-tmp");
+            std::fs::copy(&from, &tmp)
+                .and_then(|_| std::fs::rename(&tmp, &to))
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_file(&tmp);
+                })?;
+            Ok(Outcome::Saved)
+        });
+    }
+
+    fn proceed(&mut self, ctx: &egui::Context, then: Then) {
+        match then {
+            Then::Open(path) => self.open(ctx, path),
+            Then::Close => {
+                self.closing = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
     }
 
     fn navigate(&mut self, cwd: String) {
@@ -434,18 +572,23 @@ impl App {
         }
         let format = CREATE_FORMATS[0];
         let first = &sources[0];
-        let stem = if sources.len() == 1 {
-            first.file_name()
-        } else {
-            first.parent().and_then(Path::file_name)
+        let name = match sources.as_slice() {
+            [dir] if dir.is_dir() => dir.file_name(),
+            [file] => file.file_stem(),
+            _ => first.parent().and_then(Path::file_name),
         };
-        let stem = stem
+        let name = name
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "archive".into());
-        let dest = first.with_file_name(format!("{stem}.{}", format.extension()));
+        let folder = first
+            .parent()
+            .unwrap_or(Path::new("."))
+            .display()
+            .to_string();
         self.dialog = Dialog::Create(CreateForm {
             sources,
-            dest: dest.display().to_string(),
+            name,
+            folder,
             format,
             level: Level::Normal,
             zip_crypto: false,
@@ -491,7 +634,7 @@ impl App {
     }
 
     fn create(&mut self, ctx: &egui::Context, form: CreateForm) {
-        let dest = PathBuf::from(&form.dest);
+        let dest = form.dest();
         let opts = CreateOptions {
             format: form.format,
             level: form.level,
@@ -623,7 +766,7 @@ impl App {
             sources: vec![file],
             into: parent_of(entry).to_owned(),
         };
-        self.status = format!("Saved {}", base_name(entry));
+        self.status = format!("Updated {}", base_name(entry));
         self.run(ctx, Action::Modify(edit), self.password.clone());
     }
 
@@ -732,6 +875,14 @@ impl App {
             .clicked()
             {
                 self.start_rename();
+            }
+            theme::tool_separator(ui);
+            let dirty = self.dirty();
+            if theme::tool_button(ui, icon::FLOPPY_DISK, "Save", idle && dirty, dirty)
+                .on_hover_text("Write your changes to the archive (⌘S / Ctrl+S)")
+                .clicked()
+            {
+                self.save(ui.ctx());
             }
             if self.archive.is_some() {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -921,11 +1072,11 @@ impl App {
         TableBuilder::new(ui)
             .sense(sense)
             .cell_layout(Layout::left_to_right(Align::Center))
-            .column(Column::remainder().at_least(160.0).clip(true))
-            .column(Column::exact(86.0))
-            .column(Column::exact(86.0))
-            .column(Column::exact(58.0))
-            .column(Column::exact(136.0))
+            .column(Column::remainder().at_least(120.0).clip(true))
+            .column(Column::exact(70.0))
+            .column(Column::exact(70.0))
+            .column(Column::exact(48.0))
+            .column(Column::exact(118.0))
             .header(28.0, |mut header| {
                 for (key, title, right) in [
                     (SortKey::Name, "Name", false),
@@ -1235,6 +1386,10 @@ impl App {
             }
             if self.archive.is_some() {
                 theme::pill(ui, self.format);
+                if self.dirty() {
+                    ui.label(RichText::new("Unsaved changes").color(p.accent))
+                        .on_hover_text("Click Save to write them to the archive.");
+                }
                 if let Some(reason) = self.read_only {
                     let badge = format!("{} Read-only", icon::LOCK_SIMPLE);
                     ui.label(RichText::new(badge).color(p.muted))
@@ -1315,6 +1470,9 @@ impl App {
             || ctx.memory(|m| m.focused().is_some())
         {
             return;
+        }
+        if ctx.input(|i| i.key_pressed(Key::S) && i.modifiers.command) {
+            self.save(ctx);
         }
         let (up, all, delete, enter, rename, new_folder) = ctx.input(|i| {
             (
@@ -1398,23 +1556,33 @@ impl App {
                 }
             }
             Dialog::Rename { from, mut name } => {
-                let result = theme::dialog(ctx, icon::PENCIL_SIMPLE, "Rename", &from, |ui| {
-                    let field =
-                        ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY));
-                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                    let valid = valid_name(&name);
-                    let mut result = None;
-                    theme::dialog_footer(ui, |ui| {
-                        if theme::primary_button(ui, "Rename", valid).clicked() || (enter && valid)
-                        {
-                            result = Some(true);
-                        }
-                        if theme::button(ui, "Cancel").clicked() {
-                            result = Some(false);
-                        }
-                    });
-                    result
-                });
+                let result = theme::dialog_with(
+                    ctx,
+                    "dialog",
+                    340.0,
+                    icon::PENCIL_SIMPLE,
+                    "Rename",
+                    &from,
+                    |ui| {
+                        let field = ui.add(
+                            egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY),
+                        );
+                        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        let valid = valid_name(&name);
+                        let mut result = None;
+                        theme::dialog_footer(ui, |ui| {
+                            if theme::primary_button(ui, "Rename", valid).clicked()
+                                || (enter && valid)
+                            {
+                                result = Some(true);
+                            }
+                            if theme::button(ui, "Cancel").clicked() {
+                                result = Some(false);
+                            }
+                        });
+                        result
+                    },
+                );
                 match result {
                     Some(true) => {
                         let to = match from.rsplit_once('/') {
@@ -1437,13 +1605,13 @@ impl App {
                 let result = theme::dialog(
                     ctx,
                     icon::FLOPPY_DISK,
-                    "Save changes to the archive?",
+                    "Update the archive?",
                     &subtitle,
                     |ui| {
                         ui.label(format!("Update “{entry}” in {archive_name}?"));
                         let mut result = None;
                         theme::dialog_footer(ui, |ui| {
-                            if theme::primary_button(ui, "Update archive", true).clicked() {
+                            if theme::primary_button(ui, "Update", true).clicked() {
                                 result = Some(true);
                             }
                             if theme::button(ui, "Not now").clicked() {
@@ -1464,26 +1632,36 @@ impl App {
             }
             Dialog::NewFolder(mut name) => {
                 let place = format!("In /{}", self.cwd);
-                let result = theme::dialog(ctx, icon::FOLDER_PLUS, "New folder", &place, |ui| {
-                    let field =
-                        ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY));
-                    if !field.has_focus() && !field.lost_focus() {
-                        field.request_focus();
-                    }
-                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                    let valid = valid_name(&name);
-                    let mut result = None;
-                    theme::dialog_footer(ui, |ui| {
-                        if theme::primary_button(ui, "Create", valid).clicked() || (enter && valid)
-                        {
-                            result = Some(true);
+                let result = theme::dialog_with(
+                    ctx,
+                    "dialog",
+                    340.0,
+                    icon::FOLDER_PLUS,
+                    "New folder",
+                    &place,
+                    |ui| {
+                        let field = ui.add(
+                            egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY),
+                        );
+                        if !field.has_focus() && !field.lost_focus() {
+                            field.request_focus();
                         }
-                        if theme::button(ui, "Cancel").clicked() {
-                            result = Some(false);
-                        }
-                    });
-                    result
-                });
+                        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        let valid = valid_name(&name);
+                        let mut result = None;
+                        theme::dialog_footer(ui, |ui| {
+                            if theme::primary_button(ui, "Create", valid).clicked()
+                                || (enter && valid)
+                            {
+                                result = Some(true);
+                            }
+                            if theme::button(ui, "Cancel").clicked() {
+                                result = Some(false);
+                            }
+                        });
+                        result
+                    },
+                );
                 match result {
                     Some(true) => {
                         let dir = join_path(&self.cwd, name.trim());
@@ -1613,19 +1791,9 @@ impl App {
                 }
             }
             Dialog::Create(mut form) => {
-                let subtitle = match form.sources.as_slice() {
-                    [one] => base_name(&one.to_string_lossy()).to_owned(),
-                    [first, rest @ ..] => format!(
-                        "{} and {} more",
-                        base_name(&first.to_string_lossy()),
-                        rest.len()
-                    ),
-                    [] => String::new(),
-                };
-                let result =
-                    theme::dialog(ctx, icon::PLUS_SQUARE, "New archive", &subtitle, |ui| {
-                        create_form(ui, &mut form)
-                    });
+                let result = theme::dialog(ctx, icon::PLUS_SQUARE, "New archive", "", |ui| {
+                    create_form(ui, &mut form)
+                });
                 pick_contents = std::mem::take(&mut form.add_more);
                 match result {
                     Some(true) => {
@@ -1634,6 +1802,48 @@ impl App {
                     }
                     Some(false) => Dialog::None,
                     None => Dialog::Create(form),
+                }
+            }
+            Dialog::Unsaved(then) => {
+                let title = format!("Save changes to {archive_name}?");
+                let result = theme::dialog_with(
+                    ctx,
+                    "dialog",
+                    380.0,
+                    icon::FLOPPY_DISK,
+                    &title,
+                    "Your edits are lost if you don't save them.",
+                    |ui| {
+                        let mut result = None;
+                        theme::dialog_footer(ui, |ui| {
+                            if theme::primary_button(ui, "Save", true).clicked() {
+                                result = Some(Some(true));
+                            }
+                            if theme::button(ui, "Don't save").clicked() {
+                                result = Some(Some(false));
+                            }
+                            if theme::button(ui, "Cancel").clicked()
+                                || ui.input(|i| i.key_pressed(Key::Escape))
+                            {
+                                result = Some(None);
+                            }
+                        });
+                        result
+                    },
+                );
+                match result {
+                    Some(Some(true)) => {
+                        self.after_save = Some(then);
+                        self.save(ctx);
+                        Dialog::None
+                    }
+                    Some(Some(false)) => {
+                        self.working = None;
+                        self.proceed(ctx, then);
+                        Dialog::None
+                    }
+                    Some(None) => Dialog::None,
+                    None => Dialog::Unsaved(then),
                 }
             }
         };
@@ -1681,6 +1891,10 @@ impl eframe::App for App {
                 _ => self.new_archive(dropped),
             }
         }
+        if ctx.input(|i| i.viewport().close_requested()) && self.dirty() && !self.closing {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.dialog = Dialog::Unsaved(Then::Close);
+        }
         self.shortcuts(&ctx);
         if !self.opened.is_empty() {
             self.check_opened();
@@ -1707,7 +1921,7 @@ impl eframe::App for App {
         if self.archive.is_some() {
             egui::Panel::left("tree")
                 .resizable(true)
-                .default_size(210.0)
+                .default_size(160.0)
                 .min_size(140.0)
                 .frame(
                     egui::Frame::new()
@@ -1781,113 +1995,125 @@ fn path_field(ui: &mut egui::Ui, value: &mut String, browse: impl FnOnce() -> Op
 
 fn create_form(ui: &mut egui::Ui, form: &mut CreateForm) -> Option<bool> {
     let p = pal(ui.ctx());
-    let old_ext = form.format.extension();
     let mut mismatch = false;
-    egui::Grid::new("create")
-        .num_columns(2)
-        .spacing(vec2(12.0, 10.0))
+    // Scrolls when the window is too short for the whole form.
+    let max_height = ui.ctx().content_rect().height() - 150.0;
+    egui::ScrollArea::vertical()
+        .max_height(max_height)
         .show(ui, |ui| {
-            theme::form_label(ui, "Contents");
-            form.add_more |= sources_list(ui, &mut form.sources);
-            ui.end_row();
-
-            theme::form_label(ui, "Save as");
-            let dest = form.dest.clone();
-            path_field(ui, &mut form.dest, || {
-                rfd::FileDialog::new()
-                    .set_file_name(base_name(&dest))
-                    .save_file()
-            });
-            ui.end_row();
-
-            theme::form_label(ui, "Format");
-            egui::ComboBox::from_id_salt("format")
-                .selected_text(form.format.name())
-                .width(140.0)
-                .show_ui(ui, |ui| {
-                    for f in CREATE_FORMATS.iter().filter(|f| fits(**f, &form.sources)) {
-                        ui.selectable_value(&mut form.format, *f, f.name());
-                    }
-                });
-            ui.end_row();
-
-            if form.format != Format::Tar {
-                theme::form_label(ui, "Compression");
-                theme::segmented(
-                    ui,
-                    &mut form.level,
-                    &[
-                        (Level::Store, "Store"),
-                        (Level::Fast, "Fast"),
-                        (Level::Normal, "Normal"),
-                        (Level::Max, "Max"),
-                    ],
-                );
-                ui.end_row();
-            }
-
-            if form.format.encryptable() {
-                theme::form_label(ui, "Password");
-                password_field(ui, &mut form.password, &mut form.show, false);
-                ui.end_row();
-                theme::form_label(ui, "Confirm");
-                ui.add_enabled(
-                    !form.show,
-                    egui::TextEdit::singleline(&mut *form.confirm)
-                        .password(true)
-                        .desired_width(ui.available_width() - 34.0),
-                );
-                ui.end_row();
-                mismatch = !form.show && form.password != form.confirm;
-                ui.label("");
-                let hint = match (form.format, mismatch, form.password.is_empty()) {
-                    (_, true, _) => RichText::new("Passwords don't match.").color(p.danger),
-                    (_, _, true) => RichText::new("Leave empty for no encryption.").color(p.faint),
-                    (Format::SevenZ, ..) => {
-                        RichText::new("AES-256. File names are encrypted too.").color(p.faint)
-                    }
-                    _ if form.zip_crypto => RichText::new(
-                        "ZipCrypto is weak, but Explorer and Archive Utility can open it.",
-                    )
-                    .color(p.faint),
-                    _ => RichText::new("AES-256. File names stay visible.").color(p.faint),
-                };
-                ui.label(hint.size(11.5));
-                ui.end_row();
-                if form.format == Format::Zip && !form.password.is_empty() {
-                    ui.label("");
-                    ui.checkbox(
-                        &mut form.zip_crypto,
-                        "Legacy ZipCrypto (for Explorer / Archive Utility)",
-                    );
+            egui::Grid::new("create")
+                .num_columns(2)
+                .spacing(vec2(12.0, 6.0))
+                .show(ui, |ui| {
+                    theme::form_label(ui, "Contents");
+                    form.add_more |= sources_list(ui, &mut form.sources);
                     ui.end_row();
-                }
-            }
 
-            theme::form_label(ui, "Split");
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut form.split, "");
-                ui.add_enabled(
-                    form.split,
-                    egui::TextEdit::singleline(&mut form.split_mb).desired_width(64.0),
-                );
-                ui.label(RichText::new("MB").color(p.muted));
-                for (label, mb) in [("CD", "700"), ("DVD", "4480"), ("FAT32", "4095")] {
-                    if ui
-                        .add_enabled(form.split, egui::Button::new(label).small())
-                        .clicked()
-                    {
-                        form.split_mb = mb.into();
+                    theme::form_label(ui, "Name");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(220.0));
+                        ui.label(
+                            RichText::new(format!(".{}", form.format.extension())).color(p.muted),
+                        );
+                    });
+                    ui.end_row();
+
+                    theme::form_label(ui, "Save in");
+                    let folder = form.folder.clone();
+                    path_field(ui, &mut form.folder, || {
+                        rfd::FileDialog::new().set_directory(folder).pick_folder()
+                    });
+                    ui.end_row();
+
+                    theme::form_label(ui, "Format");
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("format")
+                            .selected_text(form.format.name())
+                            .width(84.0)
+                            .show_ui(ui, |ui| {
+                                for f in CREATE_FORMATS.iter().filter(|f| fits(**f, &form.sources))
+                                {
+                                    ui.selectable_value(&mut form.format, *f, f.name());
+                                }
+                            });
+                        if form.format != Format::Tar {
+                            theme::segmented(
+                                ui,
+                                &mut form.level,
+                                &[
+                                    (Level::Store, "Store"),
+                                    (Level::Fast, "Fast"),
+                                    (Level::Normal, "Normal"),
+                                    (Level::Max, "Max"),
+                                ],
+                            );
+                        }
+                    });
+                    ui.end_row();
+
+                    if form.format.encryptable() {
+                        theme::form_label(ui, "Password");
+                        password_field(ui, &mut form.password, &mut form.show, false);
+                        ui.end_row();
+                        theme::form_label(ui, "Confirm");
+                        ui.add_enabled(
+                            !form.show,
+                            egui::TextEdit::singleline(&mut *form.confirm)
+                                .password(true)
+                                .desired_width(ui.available_width() - 34.0),
+                        );
+                        ui.end_row();
+                        mismatch = !form.show && form.password != form.confirm;
+                        ui.label("");
+                        let hint = match (form.format, mismatch, form.password.is_empty()) {
+                            (_, true, _) => RichText::new("Passwords don't match.").color(p.danger),
+                            (_, _, true) => {
+                                RichText::new("Leave empty for no encryption.").color(p.faint)
+                            }
+                            (Format::SevenZ, ..) => {
+                                RichText::new("AES-256. File names are encrypted too.")
+                                    .color(p.faint)
+                            }
+                            _ if form.zip_crypto => RichText::new(
+                                "ZipCrypto is weak, but Explorer and Archive Utility can open it.",
+                            )
+                            .color(p.faint),
+                            _ => RichText::new("AES-256. File names stay visible.").color(p.faint),
+                        };
+                        ui.label(hint.size(11.5));
+                        ui.end_row();
+                        if form.format == Format::Zip && !form.password.is_empty() {
+                            ui.label("");
+                            ui.checkbox(
+                                &mut form.zip_crypto,
+                                "Legacy ZipCrypto (for Explorer / Archive Utility)",
+                            );
+                            ui.end_row();
+                        }
                     }
-                }
-            });
-            ui.end_row();
+
+                    theme::form_label(ui, "Split");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut form.split, "");
+                        ui.add_enabled(
+                            form.split,
+                            egui::TextEdit::singleline(&mut form.split_mb).desired_width(64.0),
+                        );
+                        ui.label(RichText::new("MB").color(p.muted));
+                        for (label, mb) in [("CD", "700"), ("DVD", "4480"), ("FAT32", "4095")] {
+                            if ui
+                                .add_enabled(form.split, egui::Button::new(label).small())
+                                .clicked()
+                            {
+                                form.split_mb = mb.into();
+                            }
+                        }
+                    });
+                    ui.end_row();
+                });
         });
     if !fits(form.format, &form.sources) {
         form.format = Format::Zip;
-    }
-    if let Some(stem) = form.dest.strip_suffix(&format!(".{old_ext}")) {
-        form.dest = format!("{stem}.{}", form.format.extension());
     }
     if form.show {
         *form.confirm = form.password.to_string();
@@ -1903,7 +2129,11 @@ fn create_form(ui: &mut egui::Ui, form: &mut CreateForm) -> Option<bool> {
         if theme::primary_button(
             ui,
             "Create",
-            !mismatch && !bad_split && !form.dest.is_empty() && !form.sources.is_empty(),
+            !mismatch
+                && !bad_split
+                && valid_name(form.name.trim())
+                && !form.folder.trim().is_empty()
+                && !form.sources.is_empty(),
         )
         .clicked()
         {
@@ -2282,9 +2512,10 @@ mod tests {
         std::fs::copy(fixture, &archive).unwrap();
         let ctx = egui::Context::default();
         let mut app = App::default();
-        app.open(&ctx, archive);
+        app.open(&ctx, archive.clone());
         pump(&mut app, &ctx);
         assert!(app.modifiable);
+        let original = std::fs::read(&archive).unwrap();
         let has = |app: &App, p: &str| app.entries.iter().any(|e| e.path == p);
 
         app.navigate("tree".into());
@@ -2327,6 +2558,36 @@ mod tests {
         pump(&mut app, &ctx);
         assert!(matches!(app.dialog, Dialog::Error(_)));
         assert!(has(&app, "tree/fresh"));
+
+        // Nothing reaches the archive until Save.
+        assert_eq!(std::fs::read(&archive).unwrap(), original);
+        assert!(app.dirty());
+        app.dialog = Dialog::None;
+        app.open(&ctx, archive.clone());
+        assert!(matches!(app.dialog, Dialog::Unsaved(Then::Open(_))));
+        app.dialog = Dialog::None;
+        app.save(&ctx);
+        pump(&mut app, &ctx);
+        assert!(!app.dirty() && app.working.is_none());
+        let saved: Vec<String> = hdec_core::list(&archive, &test_ctx())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert!(saved.iter().any(|p| p == "tree/fresh"), "{saved:?}");
+        assert!(
+            !saved.iter().any(|p| p.starts_with("tree/sub")),
+            "{saved:?}"
+        );
+        assert!(!archive.with_extension("zip.hdec-tmp").exists());
+    }
+
+    fn test_ctx() -> Ctx<'static> {
+        Ctx {
+            password: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(|_, _, _| {}),
+        }
     }
 
     #[test]
@@ -2363,14 +2624,10 @@ mod tests {
             "no second prompt for the same change"
         );
 
+        app.save(&ctx);
+        pump(&mut app, &ctx);
         let out = tmp.path().join("out");
-        let cancel = Arc::new(AtomicBool::new(false));
-        let c = Ctx {
-            password: None,
-            cancel,
-            progress: Arc::new(|_, _, _| {}),
-        };
-        hdec_core::extract(&archive, &out, &ExtractOptions::default(), &c).unwrap();
+        hdec_core::extract(&archive, &out, &ExtractOptions::default(), &test_ctx()).unwrap();
         assert_eq!(std::fs::read(out.join(&entry)).unwrap(), b"edited");
         assert_eq!(app.entries.iter().filter(|e| e.path == entry).count(), 1);
 
@@ -2406,7 +2663,7 @@ mod tests {
             app.navigate("tree/sub".into());
             app.selected.insert("tree/sub/b.txt".into());
         };
-        let states: [(&str, Setup); 11] = [
+        let states: [(&str, Setup); 12] = [
             ("saveback", |app, ctx, path, entries| {
                 app.finish(ctx, Outcome::Opened(path.to_path_buf(), entries.to_vec()));
                 app.dialog = Dialog::SaveBack {
@@ -2467,6 +2724,17 @@ mod tests {
                     password: None,
                 });
             }),
+            ("unsaved", |app, ctx, path, entries| {
+                app.finish(ctx, Outcome::Opened(path.to_path_buf(), entries.to_vec()));
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("x");
+                app.working = Some(Working {
+                    _dir: dir,
+                    path,
+                    dirty: true,
+                });
+                app.dialog = Dialog::Unsaved(Then::Close);
+            }),
             ("picker", |app, _, path, _| {
                 let dir = path
                     .parent()
@@ -2486,7 +2754,7 @@ mod tests {
         for theme in [egui::Theme::Dark, egui::Theme::Light] {
             for (name, setup) in states {
                 let mut harness = Harness::builder()
-                    .with_size(vec2(1040.0, 640.0))
+                    .with_size(WINDOW)
                     .with_theme(theme)
                     .build_eframe(|cc| {
                         theme::install(&cc.egui_ctx);
