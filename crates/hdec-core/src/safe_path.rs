@@ -176,6 +176,8 @@ mod tests {
         assert!(!inside("link", "..\\x"));
     }
 
+    // Unix rules only run on Unix: Windows paths read `a:b` as drive `a:`.
+    #[cfg(unix)]
     #[test]
     fn keeps_unix_names() {
         assert_eq!(ok("a:b", false), Path::new("/dest/a:b"));
