@@ -467,7 +467,36 @@ struct Meter<'a> {
     total: u64,
     /// Streamed formats report compressed bytes consumed instead of bytes written.
     consumed: Option<&'a AtomicU64>,
+    throttle: Arc<Throttle>,
     buf: Vec<u8>,
+}
+
+/// Limits progress reports to one per `Throttle::EVERY` across threads: the
+/// GUI repaints per report, and small files would send thousands a second.
+struct Throttle {
+    start: std::time::Instant,
+    last: AtomicU64,
+}
+
+impl Throttle {
+    const EVERY: u64 = 15_000_000; // ns
+
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            last: AtomicU64::new(0),
+        }
+    }
+
+    fn due(&self) -> bool {
+        let now = self.start.elapsed().as_nanos() as u64;
+        let last = self.last.load(Ordering::Relaxed);
+        now.saturating_sub(last) >= Self::EVERY
+            && self
+                .last
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+    }
 }
 
 impl<'a> Meter<'a> {
@@ -477,6 +506,7 @@ impl<'a> Meter<'a> {
             done: Arc::new(AtomicU64::new(0)),
             total,
             consumed: None,
+            throttle: Arc::new(Throttle::new()),
             buf: vec![0; 256 << 10],
         }
     }
@@ -496,6 +526,7 @@ impl<'a> Meter<'a> {
             done: self.done.clone(),
             total: self.total,
             consumed: self.consumed,
+            throttle: self.throttle.clone(),
             buf: vec![0; self.buf.len()],
         }
     }
@@ -503,7 +534,9 @@ impl<'a> Meter<'a> {
     fn advance(&self, n: usize, name: &str) {
         let done = self.done.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
         let shown = self.consumed.map_or(done, |c| c.load(Ordering::Relaxed));
-        (*self.ctx.progress)(shown, self.total, name);
+        if shown >= self.total || self.throttle.due() {
+            (*self.ctx.progress)(shown, self.total, name);
+        }
     }
 
     /// For APIs that pull from a reader (e.g. tar::Builder). Cancellation surfaces

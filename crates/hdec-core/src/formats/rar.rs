@@ -155,6 +155,7 @@ struct Sink {
     to: Target,
     done: Rc<Cell<u64>>,
     total: u64,
+    throttle: Rc<crate::Throttle>,
     name: String,
     cancel: Arc<AtomicBool>,
     progress: Arc<ProgressFn>,
@@ -187,7 +188,9 @@ impl Write for Sink {
             Target::Null => buf.len(),
         };
         self.done.set(self.done.get() + n as u64);
-        (*self.progress)(self.done.get(), self.total, &self.name);
+        if self.done.get() >= self.total || self.throttle.due() {
+            (*self.progress)(self.done.get(), self.total, &self.name);
+        }
         Ok(n)
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -242,6 +245,7 @@ pub fn extract(
         .map(|m| m.meta.unpacked_size)
         .sum();
     let done = Rc::new(Cell::new(0));
+    let throttle = Rc::new(crate::Throttle::new());
     let mut x = dest
         .map(|d| Extractor::new(d, opts.overwrite, ctx))
         .transpose()?;
@@ -301,6 +305,7 @@ pub fn extract(
             to,
             done: done.clone(),
             total,
+            throttle: throttle.clone(),
             name: clean(&meta.name),
             cancel: ctx.cancel.clone(),
             progress: ctx.progress.clone(),
