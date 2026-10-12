@@ -1,9 +1,9 @@
 //! 7z via sevenz-rust2.
 
-use crate::fs::{self as hfs, OutFile, Source};
+use crate::fs::{self as hfs, Extractor, OutFile, Source};
 use crate::sfx::{self, Skip};
 use crate::volume::Volume;
-use crate::{CreateOptions, Ctx, Entry, Error, ExtractOptions, Level, Meter, Result, safe_path};
+use crate::{CreateOptions, Ctx, Entry, Error, ExtractOptions, Level, Meter, Result};
 use sevenz_rust2::encoder_options::{AesEncoderOptions, Lzma2Options};
 use sevenz_rust2::{
     Archive, ArchiveEntry, ArchiveReader, ArchiveWriter, EncoderConfiguration, EncoderMethod,
@@ -21,8 +21,8 @@ const S_IFMT: u32 = 0o170000;
 const S_IFLNK: u32 = 0o120000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
-/// Solid block size: big enough for a good ratio, small enough that one file
-/// doesn't require decoding gigabytes.
+/// Smallest solid block: big enough for a good ratio, small enough that one
+/// file doesn't require decoding gigabytes.
 const SOLID_BLOCK: u64 = 256 << 20;
 
 impl From<sevenz_rust2::Error> for Error {
@@ -127,26 +127,27 @@ pub fn extract(
         .map(|f| f.size)
         .sum();
     let mut meter = Meter::new(ctx, total);
-    let mut warnings = Vec::new();
+    let mut x = dest
+        .map(|d| Extractor::new(d, opts.overwrite, ctx))
+        .transpose()?;
     let mut failure = None;
     reader
         .for_each_entries(|f, mut r| {
             let name = name(f);
             let result = if f.is_anti_item || !crate::is_selected(&name, only) {
                 Ok(())
-            } else if let Some(dest) = dest {
-                extract_entry(f, &name, &mut r, dest, opts, &mut meter, &mut warnings)
+            } else if let Some(x) = &mut x {
+                match extract_entry(f, &name, &mut r, x, &mut meter) {
+                    Err(Error::UnsafePath(p)) => {
+                        x.warnings.push(format!("skipped unsafe path: {p}"));
+                        Ok(())
+                    }
+                    r => r,
+                }
             } else if f.is_directory {
                 Ok(())
             } else {
                 meter.copy_sized(&name, &mut r, &mut io::sink(), f.size)
-            };
-            let result = match result {
-                Err(Error::UnsafePath(p)) => {
-                    warnings.push(format!("skipped unsafe path: {p}"));
-                    Ok(())
-                }
-                r => r,
             };
             // Entries share one decoder stream: whatever wasn't read must be skipped over.
             match result.and_then(|()| Ok(io::copy(&mut r, &mut io::sink())?)) {
@@ -158,27 +159,22 @@ pub fn extract(
             }
         })
         .map_err(|e| password_hint(e.into(), ctx))?;
-    match failure {
-        Some(e) => Err(password_hint(e, ctx)),
-        None => Ok(warnings),
+    if let Some(e) = failure {
+        return Err(password_hint(e, ctx));
     }
+    x.map_or(Ok(Vec::new()), Extractor::finish)
 }
 
 fn extract_entry(
     f: &ArchiveEntry,
     name: &str,
     r: &mut impl Read,
-    dest: &Path,
-    opts: &ExtractOptions,
+    x: &mut Extractor,
     meter: &mut Meter,
-    warnings: &mut Vec<String>,
 ) -> Result<()> {
     if f.is_directory {
-        return hfs::make_dirs(dest, &safe_path::join(dest, name)?);
+        return x.dir(name);
     }
-    let Some(out_path) = hfs::output_path(dest, name, opts.overwrite)? else {
-        return Ok(());
-    };
     let mode = unix_mode(f);
     if mode.is_some_and(|m| m & S_IFMT == S_IFLNK) {
         if f.size > 4096 {
@@ -186,19 +182,16 @@ fn extract_entry(
         }
         let mut target = Vec::new();
         meter.copy_sized(name, r, &mut target, f.size)?;
-        let target = String::from_utf8_lossy(&target);
-        if !hfs::symlink(dest, &out_path, &target)? {
-            warnings.push(format!("skipped symlink {name} -> {target}"));
-        }
+        return x.symlink(name, &String::from_utf8_lossy(&target));
+    }
+    let Some(mut out) = x.file(name, f.size)? else {
         return Ok(());
-    }
-    let mut out = OutFile::create(out_path)?;
+    };
     meter.copy_sized(name, r, &mut out, f.size)?;
-    if f.has_last_modified_date {
-        out.file().set_modified(f.last_modified_date.into())?;
-    }
-    hfs::set_mode(out.file(), mode)?;
-    out.commit()
+    let modified = f
+        .has_last_modified_date
+        .then(|| f.last_modified_date.into());
+    x.done(out, modified, mode)
 }
 
 fn archive_entry(item: &Source) -> ArchiveEntry {
@@ -267,11 +260,27 @@ pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx)
             .sum(),
     );
     let mut w = ArchiveWriter::new(BufWriter::new(OutFile::create(dest.to_path_buf())?))?;
-    let method: EncoderConfiguration = match opts.level {
-        Level::Store => EncoderMethod::COPY.into(),
-        Level::Fast => Lzma2Options::from_level(1).into(),
-        Level::Normal => Lzma2Options::from_level(5).into(),
-        Level::Max => Lzma2Options::from_level(9).into(),
+    // LZMA2 in independent chunks of 3x the dictionary, compressed on all
+    // cores (memory permitting) and decodable in parallel too.
+    let (method, solid_block): (EncoderConfiguration, u64) = match opts.level {
+        Level::Store => (EncoderMethod::COPY.into(), SOLID_BLOCK),
+        level => {
+            let preset = match level {
+                Level::Fast => 1,
+                Level::Normal => 5,
+                _ => 9,
+            };
+            let dict = lzma_rust2::Lzma2Options::with_preset(preset)
+                .lzma_options
+                .dict_size;
+            let workers = super::stream::lzma_workers(dict);
+            let chunk = 3 * u64::from(dict);
+            let block = SOLID_BLOCK.max(chunk * u64::from(workers));
+            (
+                Lzma2Options::from_level_mt(preset, workers, chunk).into(),
+                block,
+            )
+        }
     };
     match ctx.password {
         Some(pw) => {
@@ -291,7 +300,7 @@ pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx)
         ctx.check()?;
         let entry = archive_entry(item);
         if item.meta.is_file() {
-            if block_size + item.meta.len() > SOLID_BLOCK && !entries.is_empty() {
+            if block_size + item.meta.len() > solid_block && !entries.is_empty() {
                 let (e, r) = (std::mem::take(&mut entries), std::mem::take(&mut readers));
                 w.push_archive_entries(e, r)
                     .map_err(|e| ctx.or_cancelled(e))?;

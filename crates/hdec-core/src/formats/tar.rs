@@ -1,15 +1,13 @@
 //! TAR and compressed TAR (gz, bz2, xz, zst).
 
 use super::stream::{Encoder, decoder};
-use crate::fs::{self as hfs, OutFile};
+use crate::fs::{self as hfs, Extractor, OutFile};
 use crate::volume::Volume;
-use crate::{
-    CountingRead, CreateOptions, Ctx, Entry, ExtractOptions, Format, Meter, Result, safe_path,
-};
-use std::cell::Cell;
+use crate::{CountingRead, CreateOptions, Ctx, Entry, ExtractOptions, Format, Meter, Result};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime};
 use tar::EntryType;
 
@@ -76,84 +74,70 @@ pub fn extract(
     ctx: &Ctx,
 ) -> Result<Vec<String>> {
     let file = Volume::open(path)?;
-    let consumed = Cell::new(0);
+    let consumed = AtomicU64::new(0);
     let mut meter = Meter::streamed(ctx, file.len(), &consumed);
     let input = BufReader::new(CountingRead {
         inner: file,
         count: &consumed,
     });
-    let mut archive = tar::Archive::new(decoder(format, input)?);
-    let mut warnings = Vec::new();
-    for entry in archive.entries()? {
-        ctx.check()?;
-        let mut entry = entry?;
-        let name = entry_name(&entry)?;
-        if !crate::is_selected(&name, opts.only.as_deref()) {
-            continue;
+    crate::read_ahead(decoder(format, input)?, |r| {
+        let mut archive = tar::Archive::new(r);
+        let mut x = dest
+            .map(|d| Extractor::new(d, opts.overwrite, ctx))
+            .transpose()?;
+        for entry in archive.entries()? {
+            ctx.check()?;
+            let mut entry = entry?;
+            let name = entry_name(&entry)?;
+            if !crate::is_selected(&name, opts.only.as_deref()) {
+                continue;
+            }
+            let Some(x) = &mut x else {
+                meter.copy(&name, &mut entry, &mut io::sink())?;
+                continue;
+            };
+            match extract_entry(&mut entry, &name, x, &mut meter) {
+                Err(crate::Error::UnsafePath(p)) => {
+                    x.warnings.push(format!("skipped unsafe path: {p}"))
+                }
+                r => r?,
+            }
         }
-        let Some(dest) = dest else {
-            meter.copy(&name, &mut entry, &mut io::sink())?;
-            continue;
-        };
-        match extract_entry(&mut entry, &name, dest, opts, &mut meter, &mut warnings) {
-            Err(crate::Error::UnsafePath(p)) => warnings.push(format!("skipped unsafe path: {p}")),
-            r => r?,
-        }
-    }
-    Ok(warnings)
+        x.map_or(Ok(Vec::new()), Extractor::finish)
+    })
 }
 
 fn extract_entry(
     entry: &mut tar::Entry<impl io::Read>,
     name: &str,
-    dest: &Path,
-    opts: &ExtractOptions,
+    x: &mut Extractor,
     meter: &mut Meter,
-    warnings: &mut Vec<String>,
 ) -> Result<()> {
     let kind = entry.header().entry_type();
-    match kind {
-        EntryType::Directory => return hfs::make_dirs(dest, &safe_path::join(dest, name)?),
-        EntryType::Regular
-        | EntryType::Continuous
-        | EntryType::GNUSparse
-        | EntryType::Symlink
-        | EntryType::Link => {}
-        other => {
-            warnings.push(format!("skipped {name}: unsupported entry type {other:?}"));
-            return Ok(());
-        }
-    }
-    let Some(out_path) = hfs::output_path(dest, name, opts.overwrite)? else {
-        return Ok(());
+    let link = || -> Result<String> {
+        Ok(entry
+            .link_name()?
+            .map(|l| l.to_string_lossy().into_owned())
+            .unwrap_or_default())
     };
-    let link = entry
-        .link_name()?
-        .map(|l| l.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if kind == EntryType::Symlink {
-        if !hfs::symlink(dest, &out_path, &link)? {
-            warnings.push(format!("skipped symlink {name} -> {link}"));
+    match kind {
+        EntryType::Directory => x.dir(name),
+        EntryType::Symlink => x.symlink(name, &link()?),
+        EntryType::Link => x.hard_link(name, &link()?),
+        EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
+            let Some(mut out) = x.file(name, entry.size())? else {
+                return Ok(());
+            };
+            meter.copy(name, entry, &mut out)?;
+            let header = entry.header();
+            x.done(out, mtime(header), header.mode().ok())
         }
-        return Ok(());
-    }
-    if kind == EntryType::Link {
-        let target = safe_path::join(dest, &link)?;
-        if fs::symlink_metadata(&out_path).is_ok() {
-            fs::remove_file(&out_path)?;
+        other => {
+            x.warnings
+                .push(format!("skipped {name}: unsupported entry type {other:?}"));
+            Ok(())
         }
-        if fs::hard_link(&target, &out_path).is_err() {
-            warnings.push(format!("skipped hard link {name} -> {link}"));
-        }
-        return Ok(());
     }
-    let mut out = OutFile::create(out_path)?;
-    meter.copy(name, entry, &mut out)?;
-    if let Some(t) = mtime(entry.header()) {
-        out.file().set_modified(t)?;
-    }
-    hfs::set_mode(out.file(), entry.header().mode().ok())?;
-    out.commit()
 }
 
 pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx) -> Result<()> {

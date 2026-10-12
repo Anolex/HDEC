@@ -21,7 +21,8 @@ for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc aarch64
 ## Hard rules
 - **No C/C++ in the dependency tree.** Before adding a crate, check it (and its features) doesn't build C. `zip`: `default-features = false`, never enable `zstd`. `sevenz-rust2`: never `zstd`. `rars`: `encryption` + `write` only (no `parallel`/`recovery` unless checked). `bzip2`/`flate2`: Rust backends only.
 - **Every filesystem path derived from an archive goes through `safe_path::join`.** No exceptions, including symlink targets.
-- **Never overwrite** a source archive or existing file in place: write `*.hdec-tmp`, then rename; remove partials on error/cancel.
+- **Never overwrite** a source archive or existing file in place: write `*.hdec-tmp`, then rename; remove partials on error/cancel. Extraction may write a *new* file directly, but only with `create_new` (`OutFile::create_new`), never over something that exists.
+- Extraction goes through `fs::Extractor` (cached folder checks, writer threads); don't open output files in format code.
 - Passwords: `Zeroizing<String>`, never logged, never persisted.
 - Don't write more bytes than an entry declares.
 - RAR writing goes only through `rars` (clean-room, Apache-2.0, written from a public spec). Never use, port or consult RARLAB's unRAR source: its license forbids using it to build a RAR creator.

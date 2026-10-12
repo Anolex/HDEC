@@ -1,6 +1,6 @@
 //! RAR via `rars`: reads RAR 1.3–7, writes RAR5.
 
-use crate::fs::{self as hfs, OutFile};
+use crate::fs::{self as hfs, Extractor, Out};
 use crate::volume::{self, Volume};
 use crate::{Ctx, Entry, Error, ExtractOptions, ProgressFn, Result};
 use rars::{
@@ -140,13 +140,12 @@ pub fn list(path: &Path, ctx: &Ctx) -> Result<Vec<Entry>> {
 /// Where one entry's bytes go, and what to do once it is complete.
 enum Pending {
     File {
-        out: Rc<RefCell<Option<OutFile>>>,
+        out: Rc<RefCell<Option<Out>>>,
         modified: Option<SystemTime>,
         mode: Option<u32>,
     },
     Link {
         target: Rc<RefCell<Vec<u8>>>,
-        path: PathBuf,
         name: String,
     },
 }
@@ -162,7 +161,7 @@ struct Sink {
 }
 
 enum Target {
-    File(Rc<RefCell<Option<OutFile>>>),
+    File(Rc<RefCell<Option<Out>>>),
     Buf(Rc<RefCell<Vec<u8>>>),
     Null,
 }
@@ -199,29 +198,20 @@ impl Write for Sink {
     }
 }
 
-fn finish(pending: Option<Pending>, dest: &Path, warnings: &mut Vec<String>) -> Result<()> {
+/// Called when the next entry starts (or at the end): the previous one is complete.
+fn finish(pending: Option<Pending>, x: &mut Extractor) -> Result<()> {
     match pending {
         None => Ok(()),
         Some(Pending::File {
             out,
             modified,
             mode,
-        }) => {
-            let Some(out) = out.borrow_mut().take() else {
-                return Ok(());
-            };
-            if let Some(t) = modified {
-                out.file().set_modified(t)?;
-            }
-            hfs::set_mode(out.file(), mode)?;
-            out.commit()
-        }
-        Some(Pending::Link { target, path, name }) => {
-            let target = String::from_utf8_lossy(&target.borrow()).into_owned();
-            if !hfs::symlink(dest, &path, &target)? {
-                warnings.push(format!("skipped symlink {name} -> {target}"));
-            }
-            Ok(())
+        }) => match out.borrow_mut().take() {
+            Some(out) => x.done(out, modified, mode),
+            None => Ok(()),
+        },
+        Some(Pending::Link { target, name }) => {
+            x.symlink(&name, &String::from_utf8_lossy(&target.borrow()))
         }
     }
 }
@@ -236,9 +226,15 @@ pub fn extract(
     let archives = open(path, ctx)?;
     let members = members(&archives, ctx)?;
     let only = opts.only.as_deref();
-    let modified: HashMap<String, Option<SystemTime>> = members
+    // The callback's metadata lacks these.
+    let known: HashMap<String, (Option<SystemTime>, u64)> = members
         .iter()
-        .map(|m| (member_name(m), m.meta.modification_time()))
+        .map(|m| {
+            (
+                member_name(m),
+                (m.meta.modification_time(), m.meta.unpacked_size),
+            )
+        })
         .collect();
     let total = members
         .iter()
@@ -246,40 +242,44 @@ pub fn extract(
         .map(|m| m.meta.unpacked_size)
         .sum();
     let done = Rc::new(Cell::new(0));
-    let mut warnings = Vec::new();
+    let mut x = dest
+        .map(|d| Extractor::new(d, opts.overwrite, ctx))
+        .transpose()?;
     let mut pending = None;
     let mut failure = None;
 
-    let result = rars::extract_volumes_to_with_options(&archives, options(ctx), |meta| {
+    let open_entry = |meta: &rars::ExtractedEntryMeta| {
         let step = (|| -> Result<Target> {
-            let dest_dir = dest.unwrap_or(Path::new(""));
-            finish(pending.take(), dest_dir, &mut warnings)?;
-            let name = clean(&meta.name);
-            let Some(dest) = dest.filter(|_| crate::is_selected(&name, only)) else {
+            let Some(x) = &mut x else {
                 return Ok(Target::Null);
             };
-            if meta.is_directory {
-                hfs::make_dirs(dest, &crate::safe_path::join(dest, &name)?)?;
+            finish(pending.take(), x)?;
+            let name = clean(&meta.name);
+            if !crate::is_selected(&name, only) {
                 return Ok(Target::Null);
             }
-            let Some(out_path) = hfs::output_path(dest, &name, opts.overwrite)? else {
+            if meta.is_directory {
+                x.dir(&name)?;
                 return Ok(Target::Null);
-            };
+            }
             let unix = meta.attr_source == AttrSource::Unix;
             if unix && meta.file_attr & S_IFMT == S_IFLNK {
                 let target = Rc::new(RefCell::new(Vec::new()));
                 pending = Some(Pending::Link {
                     target: target.clone(),
-                    path: out_path,
                     name,
                 });
                 return Ok(Target::Buf(target));
             }
-            let out = Rc::new(RefCell::new(Some(OutFile::create(out_path)?)));
+            let (modified, size) = known.get(&name).copied().unwrap_or((None, u64::MAX));
+            let Some(out) = x.file(&name, size)? else {
+                return Ok(Target::Null);
+            };
+            let out = Rc::new(RefCell::new(Some(out)));
             let mode = unix.then_some(meta.file_attr as u32 & 0o7777);
             pending = Some(Pending::File {
                 out: out.clone(),
-                modified: modified.get(&name).copied().flatten(),
+                modified,
                 mode,
             });
             Ok(Target::File(out))
@@ -287,7 +287,9 @@ pub fn extract(
         let to = match step {
             Ok(to) => to,
             Err(Error::UnsafePath(p)) => {
-                warnings.push(format!("skipped unsafe path: {p}"));
+                if let Some(x) = &mut x {
+                    x.warnings.push(format!("skipped unsafe path: {p}"));
+                }
                 Target::Null
             }
             Err(e) => {
@@ -303,15 +305,20 @@ pub fn extract(
             cancel: ctx.cancel.clone(),
             progress: ctx.progress.clone(),
         }) as Box<dyn Write>)
-    });
+    };
+    // One file: independent (non-solid) members decode on all cores.
+    let result = match archives.as_slice() {
+        [one] => one.extract_to_parallel_buffered_with_options(options(ctx), open_entry),
+        all => rars::extract_volumes_to_with_options(all, options(ctx), open_entry),
+    };
     if let Some(e) = failure {
         return Err(e);
     }
     result.map_err(|e| map_err(e, ctx))?;
-    let Some(dest) = dest else {
-        return Ok(warnings);
+    let Some(mut x) = x else {
+        return Ok(Vec::new());
     };
-    finish(pending.take(), dest, &mut warnings)?;
+    finish(pending.take(), &mut x)?;
 
     // `extract_to` skips RAR5 redirections; recreate symlinks from the metadata.
     for m in &members {
@@ -320,13 +327,11 @@ pub fn extract(
             continue;
         }
         match (symlink_target(m), &m.detail) {
-            (Some(target), _) => match hfs::output_path(dest, &name, opts.overwrite) {
-                Ok(Some(link)) if hfs::symlink(dest, &link, &target)? => {}
-                Ok(None) => {}
-                Ok(Some(_)) | Err(Error::UnsafePath(_)) => {
-                    warnings.push(format!("skipped symlink {name} -> {target}"))
-                }
-                Err(e) => return Err(e),
+            (Some(target), _) => match x.symlink(&name, &target) {
+                Err(Error::UnsafePath(_)) => x
+                    .warnings
+                    .push(format!("skipped symlink {name} -> {target}")),
+                r => r?,
             },
             (
                 None,
@@ -335,14 +340,14 @@ pub fn extract(
                     ..
                 },
             ) => {
-                warnings.push(format!(
+                x.warnings.push(format!(
                     "skipped {name}: hard links, junctions and file copies aren't supported"
                 ));
             }
             _ => {}
         }
     }
-    Ok(warnings)
+    x.finish()
 }
 
 /// True for a RAR that isn't one part of a multi-volume set.

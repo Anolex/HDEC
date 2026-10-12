@@ -20,8 +20,8 @@ ruzstd = "0.9.1"
 sevenz-rust2 = { version = "0.24.0", default-features = false, features = ["aes256", "bzip2", "compress", "deflate", "ppmd"] }
 tempfile = "3"
 crc32fast = "1.5"
-# read-only: never enable `write` (we don't create RAR)
-rars = { version = "0.10.0", default-features = false, features = ["encryption", "write"] }
+# `parallel` = rayon (pure Rust); never `recovery` unchecked
+rars = { version = "0.10.0", default-features = false, features = ["encryption", "write", "parallel"] }
 eframe = "0.36.2"
 egui_extras = "0.36.2"
 rfd = "0.17.2"

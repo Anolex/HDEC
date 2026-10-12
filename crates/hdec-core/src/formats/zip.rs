@@ -1,13 +1,13 @@
-use crate::fs::{self as hfs, OutFile};
+use crate::fs::{self as hfs, Extractor, Out, OutFile, Target};
 use crate::volume::Volume;
-use crate::{
-    CreateOptions, Ctx, Edit, Entry, Error, ExtractOptions, Level, Meter, Result, safe_path,
-};
+use crate::{CreateOptions, Ctx, Edit, Entry, Error, ExtractOptions, Level, Meter, Result};
 use jiff::tz::TimeZone;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 use zip::result::ZipError;
 use zip::unstable::write::FileOptionsExt;
@@ -104,36 +104,50 @@ pub fn extract(
         }
     }
     let mut meter = Meter::new(ctx, items.iter().map(|i| i.size).sum());
-    let mut warnings = Vec::new();
+    let Some(dest) = dest else {
+        let jobs = items.iter().filter(|i| !i.is_dir).map(|i| (i, None));
+        decode_parallel(path, jobs.collect(), all_cores(), ctx, &meter)?;
+        return Ok(Vec::new());
+    };
+    let mut x = Extractor::new(dest, opts.overwrite, ctx)?;
+    let mut seen = HashSet::new();
+    let distinct = items
+        .iter()
+        .all(|i| seen.insert(i.name.trim_end_matches('/')));
+    let mut jobs = Vec::new();
     for item in &items {
-        let result = match dest {
-            None if item.is_dir => Ok(()),
-            None => read_entry(&mut zip, item, ctx, &mut meter, &mut io::sink()),
-            Some(dest) => extract_entry(&mut zip, item, dest, opts, ctx, &mut meter, &mut warnings),
+        let result = if !distinct {
+            // Same name twice: keep archive order, the parallel path can't.
+            extract_entry(&mut zip, item, &mut x, ctx, &mut meter, None)
+        } else {
+            extract_entry(&mut zip, item, &mut x, ctx, &mut meter, Some(&mut jobs))
         };
         match result {
-            Err(Error::UnsafePath(p)) => warnings.push(format!("skipped unsafe path: {p}")),
+            Err(Error::UnsafePath(p)) => x.warnings.push(format!("skipped unsafe path: {p}")),
             r => r?,
         }
     }
-    Ok(warnings)
+    decode_parallel(path, jobs, hfs::writer_threads(), ctx, &meter)?;
+    x.finish()
 }
 
-fn extract_entry(
+fn all_cores() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get())
+}
+
+/// Folders and links are made here; files are written now, or with `defer`
+/// only resolved and queued for `decode_parallel`.
+fn extract_entry<'i>(
     zip: &mut Archive,
-    item: &Item,
-    dest: &Path,
-    opts: &ExtractOptions,
+    item: &'i Item,
+    x: &mut Extractor,
     ctx: &Ctx,
     meter: &mut Meter,
-    warnings: &mut Vec<String>,
+    defer: Option<&mut Vec<(&'i Item, Option<Target>)>>,
 ) -> Result<()> {
     if item.is_dir {
-        return hfs::make_dirs(dest, &safe_path::join(dest, &item.name)?);
+        return x.dir(&item.name);
     }
-    let Some(out_path) = hfs::output_path(dest, &item.name, opts.overwrite)? else {
-        return Ok(());
-    };
     if item.is_symlink {
         if item.size > 4096 {
             return Err(Error::Corrupt(format!(
@@ -143,19 +157,66 @@ fn extract_entry(
         }
         let mut target = Vec::new();
         read_entry(zip, item, ctx, meter, &mut target)?;
-        let target = String::from_utf8_lossy(&target);
-        if !hfs::symlink(dest, &out_path, &target)? {
-            warnings.push(format!("skipped symlink {} -> {target}", item.name));
+        return x.symlink(&item.name, &String::from_utf8_lossy(&target));
+    }
+    match defer {
+        Some(jobs) => {
+            if let Some(t) = x.target(&item.name)? {
+                jobs.push((item, Some(t)));
+            }
+            Ok(())
         }
-        return Ok(());
+        None => {
+            let Some(mut out) = x.file(&item.name, item.size)? else {
+                return Ok(());
+            };
+            read_entry(zip, item, ctx, meter, &mut out)?;
+            x.done(out, item.modified, item.mode)
+        }
     }
-    let mut out = OutFile::create(out_path)?;
-    read_entry(zip, item, ctx, meter, &mut out)?;
-    if let Some(t) = item.modified {
-        out.file().set_modified(t)?;
-    }
-    hfs::set_mode(out.file(), item.mode)?;
-    out.commit()
+}
+
+/// Decodes `jobs` on `threads` threads, each with its own handle on the
+/// archive, writing each file straight to its target (`None` = test only).
+fn decode_parallel(
+    path: &Path,
+    jobs: Vec<(&Item, Option<Target>)>,
+    threads: usize,
+    ctx: &Ctx,
+    meter: &Meter,
+) -> Result<()> {
+    let next = AtomicUsize::new(0);
+    let error = Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..threads.min(jobs.len()) {
+            s.spawn(|| {
+                let run = || -> Result<()> {
+                    let mut zip = open(path)?;
+                    let mut meter = meter.fork();
+                    while let Some((item, target)) = jobs.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        if error.lock().unwrap().is_some() {
+                            break;
+                        }
+                        ctx.check()?;
+                        match target {
+                            None => read_entry(&mut zip, item, ctx, &mut meter, &mut io::sink())?,
+                            Some(t) => {
+                                let mut out = Out::new(t, item.size)?;
+                                read_entry(&mut zip, item, ctx, &mut meter, &mut out)?;
+                                out.finish(item.modified, item.mode)?;
+                            }
+                        }
+                    }
+                    Ok(())
+                };
+                if let Err(e) = run() {
+                    error.lock().unwrap().get_or_insert(e);
+                }
+            });
+        }
+    });
+    error.into_inner().unwrap().map_or(Ok(()), Err)
 }
 
 fn read_entry(

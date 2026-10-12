@@ -1241,3 +1241,52 @@ fn edits_existing_rar_files() {
         fs::read(fixture("rar5.rar")).unwrap()
     );
 }
+
+#[test]
+fn duplicate_names_follow_the_overwrite_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("dup.tar");
+    let mut b = tar::Builder::new(fs::File::create(&archive).unwrap());
+    let mut add = |name: &str, data: &[u8]| {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        b.append_data(&mut h, name, data).unwrap();
+    };
+    add("d/x.txt", b"one");
+    // Enough files in between that the writer threads are busy.
+    for i in 0..200 {
+        add(&format!("d/f{i}.txt"), b"filler");
+    }
+    add("d/x.txt", b"two");
+    b.into_inner().unwrap();
+
+    let cancel = AtomicBool::new(false);
+    for (overwrite, x, renamed) in [
+        (Overwrite::Skip, "one", None),
+        (Overwrite::Replace, "two", None),
+        (Overwrite::Rename, "one", Some("two")),
+    ] {
+        let out = tmp.path().join(format!("{overwrite:?}"));
+        let opts = ExtractOptions {
+            only: None,
+            overwrite,
+        };
+        hdec_core::extract(&archive, &out, &opts, &ctx(None, &cancel)).unwrap();
+        assert_eq!(
+            fs::read(out.join("d/x.txt")).unwrap(),
+            x.as_bytes(),
+            "{overwrite:?}"
+        );
+        let second = fs::read(out.join("d/x (1).txt")).ok();
+        assert_eq!(
+            second.as_deref(),
+            renamed.map(str::as_bytes),
+            "{overwrite:?}"
+        );
+        assert_eq!(
+            fs::read_dir(out.join("d")).unwrap().count(),
+            201 + renamed.iter().count()
+        );
+    }
+}

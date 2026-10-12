@@ -10,13 +10,12 @@ pub mod safe_path;
 mod sfx;
 mod volume;
 
-use std::cell::Cell;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 #[derive(Debug)]
@@ -463,10 +462,11 @@ fn is_selected(name: &str, only: Option<&[String]>) -> bool {
 /// Copies entry data while reporting progress and honouring cancellation.
 struct Meter<'a> {
     ctx: &'a Ctx<'a>,
-    done: Cell<u64>,
+    /// Shared by `fork`ed meters on other threads.
+    done: Arc<AtomicU64>,
     total: u64,
     /// Streamed formats report compressed bytes consumed instead of bytes written.
-    consumed: Option<&'a Cell<u64>>,
+    consumed: Option<&'a AtomicU64>,
     buf: Vec<u8>,
 }
 
@@ -474,7 +474,7 @@ impl<'a> Meter<'a> {
     fn new(ctx: &'a Ctx<'a>, total: u64) -> Self {
         Self {
             ctx,
-            done: Cell::new(0),
+            done: Arc::new(AtomicU64::new(0)),
             total,
             consumed: None,
             buf: vec![0; 256 << 10],
@@ -482,16 +482,27 @@ impl<'a> Meter<'a> {
     }
 
     /// Progress = `consumed` (fed by a `CountingRead` on the archive file) out of the archive size.
-    fn streamed(ctx: &'a Ctx<'a>, archive_size: u64, consumed: &'a Cell<u64>) -> Self {
+    fn streamed(ctx: &'a Ctx<'a>, archive_size: u64, consumed: &'a AtomicU64) -> Self {
         Self {
             consumed: Some(consumed),
             ..Self::new(ctx, archive_size)
         }
     }
 
+    /// Same counter, own buffer: for worker threads.
+    fn fork(&self) -> Self {
+        Self {
+            ctx: self.ctx,
+            done: self.done.clone(),
+            total: self.total,
+            consumed: self.consumed,
+            buf: vec![0; self.buf.len()],
+        }
+    }
+
     fn advance(&self, n: usize, name: &str) {
-        self.done.set(self.done.get() + n as u64);
-        let shown = self.consumed.map_or(self.done.get(), Cell::get);
+        let done = self.done.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+        let shown = self.consumed.map_or(done, |c| c.load(Ordering::Relaxed));
         (*self.ctx.progress)(shown, self.total, name);
     }
 
@@ -558,13 +569,83 @@ impl<R: Read> Read for MeterRead<'_, '_, R> {
 /// Counts bytes read from the archive file, for `Meter::streamed`.
 struct CountingRead<'a, R> {
     inner: R,
-    count: &'a Cell<u64>,
+    count: &'a AtomicU64,
 }
 
 impl<R: Read> Read for CountingRead<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
-        self.count.set(self.count.get() + n as u64);
+        self.count.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+impl<R: io::Seek> io::Seek for CountingRead<'_, R> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+/// Runs a decoder on its own thread, a few chunks ahead of `f`, so
+/// decompression overlaps with whatever `f` does with the data.
+fn read_ahead<T>(mut r: impl Read + Send, f: impl FnOnce(&mut ChunkReader) -> T) -> T {
+    const CHUNK: usize = 1 << 20;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<Vec<u8>>>(4);
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            loop {
+                let mut buf = vec![0; CHUNK];
+                let mut n = 0;
+                let result = loop {
+                    match r.read(&mut buf[n..]) {
+                        Ok(0) => break Ok(()),
+                        Ok(k) => {
+                            n += k;
+                            if n == CHUNK {
+                                break Ok(());
+                            }
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(e) => break Err(e),
+                    }
+                };
+                buf.truncate(n);
+                let last = n < CHUNK || result.is_err();
+                let msg = result.map(|()| buf);
+                // A gone receiver means the consumer stopped (done, error or cancel).
+                if tx.send(msg).is_err() || last {
+                    return;
+                }
+            }
+        });
+        f(&mut ChunkReader {
+            rx,
+            chunk: Vec::new(),
+            pos: 0,
+        })
+    })
+}
+
+struct ChunkReader {
+    rx: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+    chunk: Vec<u8>,
+    pos: usize,
+}
+
+impl Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        while self.pos == self.chunk.len() {
+            match self.rx.recv() {
+                Ok(chunk) => (self.chunk, self.pos) = (chunk?, 0),
+                Err(_) => return Ok(0), // producer finished
+            }
+            if self.chunk.is_empty() {
+                return Ok(0);
+            }
+        }
+        let n = buf.len().min(self.chunk.len() - self.pos);
+        buf[..n].copy_from_slice(&self.chunk[self.pos..self.pos + n]);
+        self.pos += n;
         Ok(n)
     }
 }

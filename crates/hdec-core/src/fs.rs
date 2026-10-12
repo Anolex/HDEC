@@ -1,10 +1,17 @@
-//! Filesystem helpers shared by all formats: crash-safe output files, safe
-//! directory creation, symlinks, and walking source trees.
+//! Filesystem helpers shared by all formats: crash-safe output files, the
+//! extraction writer (cached folder checks, a pool of writer threads), and
+//! walking source trees.
 
-use crate::{Error, Overwrite, Result, safe_path};
+use crate::{Ctx, Error, Overwrite, Result, safe_path};
+use std::collections::HashSet;
 use std::fs::{self, File, Metadata};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::SystemTime;
 
 /// Writes to `<path>.hdec-tmp`; `commit` renames it over `path`.
 /// Dropped without `commit` (error, cancel) → the temp file is removed.
@@ -29,12 +36,35 @@ impl OutFile {
         })
     }
 
+    /// Writes `path` directly; fails if anything (even a dangling symlink) is
+    /// there. Nothing is overwritten, so no temp file and no rename are needed;
+    /// an uncommitted file is still removed.
+    pub fn create_new(path: PathBuf) -> Result<Self> {
+        let file = File::options().write(true).create_new(true).open(&path)?;
+        Ok(Self {
+            tmp: path.clone(),
+            path,
+            file,
+            committed: false,
+        })
+    }
+
+    fn new(path: PathBuf, replace: bool) -> Result<Self> {
+        if replace {
+            Self::create(path)
+        } else {
+            Self::create_new(path)
+        }
+    }
+
     pub fn file(&self) -> &File {
         &self.file
     }
 
     pub fn commit(mut self) -> Result<()> {
-        fs::rename(&self.tmp, &self.path)?;
+        if self.tmp != self.path {
+            fs::rename(&self.tmp, &self.path)?;
+        }
         self.committed = true;
         Ok(())
     }
@@ -63,6 +93,353 @@ impl Seek for OutFile {
     }
 }
 
+/// Entries up to this size are decoded into memory and written by the pool;
+/// bigger ones are written by the decoder and only finished by the pool.
+const BUFFERED: u64 = 1 << 20;
+
+/// Writer threads. File creation, not bandwidth, is the bottleneck: on APFS
+/// 4–8 threads write small files ~2x faster than one, more gets slower.
+pub(crate) fn writer_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 8))
+}
+
+/// One extracted file being filled. `finish` sets its time and mode and
+/// commits it; dropped unfinished, nothing is left behind.
+pub(crate) struct Out {
+    path: PathBuf,
+    replace: bool,
+    data: Data,
+}
+
+enum Data {
+    Buf(Vec<u8>),
+    File(OutFile),
+}
+
+impl Out {
+    /// `size` is the declared size (a capacity hint only; `u64::MAX` = unknown).
+    pub fn new(target: &Target, size: u64) -> Result<Self> {
+        let data = if size <= BUFFERED {
+            Data::Buf(Vec::with_capacity(size as usize))
+        } else {
+            Data::File(OutFile::new(target.path.clone(), target.replace)?)
+        };
+        Ok(Self {
+            path: target.path.clone(),
+            replace: target.replace,
+            data,
+        })
+    }
+
+    pub fn finish(self, modified: Option<SystemTime>, mode: Option<u32>) -> Result<()> {
+        let out = match self.data {
+            Data::File(f) => f,
+            Data::Buf(buf) => {
+                let mut f = OutFile::new(self.path, self.replace)?;
+                f.write_all(&buf)?;
+                f
+            }
+        };
+        if let Some(t) = modified {
+            out.file().set_modified(t)?;
+        }
+        set_mode(out.file(), mode)?;
+        out.commit()
+    }
+}
+
+impl Write for Out {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match &mut self.data {
+            Data::Buf(b) => {
+                b.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            Data::File(f) => f.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.data {
+            Data::Buf(_) => Ok(()),
+            Data::File(f) => f.flush(),
+        }
+    }
+}
+
+/// Where an entry goes. `replace`: something is there and the policy is Replace.
+pub(crate) struct Target {
+    pub path: PathBuf,
+    replace: bool,
+}
+
+/// Extracts into `dest`: checks each folder once and hands finished files
+/// and symlinks to writer threads; hard links come last.
+pub(crate) struct Extractor {
+    dest: PathBuf,
+    overwrite: Overwrite,
+    /// Folders known to be real directories (created or checked).
+    dirs: HashSet<PathBuf>,
+    /// Folders this run created: nothing in them predates us.
+    created: HashSet<PathBuf>,
+    /// Outputs promised to entries so far (some may still be queued).
+    claimed: HashSet<PathBuf>,
+    /// Hard links `(name, path, target)`, made once their targets are written.
+    links: Vec<(String, PathBuf, PathBuf)>,
+    pub warnings: Vec<String>,
+    pool: Pool,
+}
+
+impl Extractor {
+    pub fn new(dest: &Path, overwrite: Overwrite, ctx: &Ctx) -> Result<Self> {
+        fs::create_dir_all(dest)?;
+        Ok(Self {
+            dest: dest.to_path_buf(),
+            overwrite,
+            dirs: HashSet::from([dest.to_path_buf()]),
+            created: HashSet::new(),
+            claimed: HashSet::new(),
+            links: Vec::new(),
+            warnings: Vec::new(),
+            pool: Pool::new(writer_threads(), ctx.cancel.clone()),
+        })
+    }
+
+    pub fn dir(&mut self, name: &str) -> Result<()> {
+        let dir = safe_path::join(&self.dest, name)?;
+        self.make_dirs(&dir)
+    }
+
+    /// Creates `dir` one component at a time, refusing to pass through
+    /// symlinks or files. `create_dir` never follows a symlink, so only an
+    /// existing name costs a second look.
+    fn make_dirs(&mut self, dir: &Path) -> Result<()> {
+        if self.dirs.contains(dir) {
+            return Ok(());
+        }
+        let parent = match dir.parent() {
+            Some(p) if dir.starts_with(&self.dest) => p,
+            _ => return Err(Error::UnsafePath(dir.display().to_string())),
+        };
+        self.make_dirs(parent)?;
+        if self.claimed.contains(dir) {
+            // A queued link or file has this name: let it land, then look.
+            self.pool.wait()?;
+        }
+        match fs::create_dir(dir) {
+            Ok(()) => {
+                self.created.insert(dir.to_path_buf());
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if !fs::symlink_metadata(dir)?.is_dir() {
+                    return Err(Error::UnsafePath(dir.display().to_string()));
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+        self.dirs.insert(dir.to_path_buf());
+        Ok(())
+    }
+
+    /// Resolves where entry `name` goes. `None` = skip (exists, policy Skip).
+    pub fn target(&mut self, name: &str) -> Result<Option<Target>> {
+        self.pool.check()?;
+        let path = safe_path::join(&self.dest, name)?;
+        let parent = path.parent().unwrap_or(&self.dest).to_path_buf();
+        self.make_dirs(&parent)?;
+        let claimed = self.claimed.contains(&path);
+        if claimed {
+            // Same name twice: let the earlier one land first.
+            self.pool.wait()?;
+        }
+        // In a folder we created, only our own entries can exist.
+        let exists =
+            (claimed || !self.created.contains(&parent)) && fs::symlink_metadata(&path).is_ok();
+        let target = match (exists, self.overwrite) {
+            (false, _) => Target {
+                path,
+                replace: false,
+            },
+            (true, Overwrite::Skip) => return Ok(None),
+            (true, Overwrite::Replace) => Target {
+                path,
+                replace: true,
+            },
+            (true, Overwrite::Rename) => Target {
+                path: unique(&path, &self.claimed),
+                replace: false,
+            },
+        };
+        self.claimed.insert(target.path.clone());
+        Ok(Some(target))
+    }
+
+    /// Opens entry `name` for writing; `None` = skip.
+    pub fn file(&mut self, name: &str, size: u64) -> Result<Option<Out>> {
+        self.target(name)?.map(|t| Out::new(&t, size)).transpose()
+    }
+
+    /// Queues a filled entry for the writer threads.
+    pub fn done(
+        &mut self,
+        out: Out,
+        modified: Option<SystemTime>,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        self.pool
+            .submit(Box::new(move || out.finish(modified, mode).map(|()| None)))
+    }
+
+    /// Queued right away: `make_dirs` and `create_new` never follow links, so
+    /// a link can't redirect later entries.
+    pub fn symlink(&mut self, name: &str, target: &str) -> Result<()> {
+        let Some(t) = self.target(name)? else {
+            return Ok(());
+        };
+        let (dest, name, target) = (self.dest.clone(), name.to_owned(), target.to_owned());
+        self.pool.submit(Box::new(move || {
+            Ok((!symlink(&dest, &t.path, &target)?)
+                .then(|| format!("skipped symlink {name} -> {target}")))
+        }))
+    }
+
+    /// Hard link to `target`, an earlier entry's name.
+    pub fn hard_link(&mut self, name: &str, target: &str) -> Result<()> {
+        let target = safe_path::join(&self.dest, target)?;
+        if let Some(t) = self.target(name)? {
+            self.links.push((name.to_owned(), t.path, target));
+        }
+        Ok(())
+    }
+
+    /// Once every file is written, creates the hard links.
+    pub fn finish(mut self) -> Result<Vec<String>> {
+        self.pool.wait()?;
+        for (name, path, target) in std::mem::take(&mut self.links) {
+            if fs::symlink_metadata(&path).is_ok() {
+                fs::remove_file(&path)?;
+            }
+            if fs::hard_link(&target, &path).is_err() {
+                let target = target.display();
+                self.warnings
+                    .push(format!("skipped hard link {name} -> {target}"));
+            }
+        }
+        self.pool.finish()?;
+        let mut warnings = self.warnings;
+        warnings.append(&mut self.pool.state.warnings.lock().unwrap());
+        Ok(warnings)
+    }
+}
+
+/// Returns a warning, if any.
+type Job = Box<dyn FnOnce() -> Result<Option<String>> + Send>;
+
+/// Writer threads fed through a bounded queue. The first error stops the
+/// rest; once cancelled, queued jobs are dropped (and leave nothing behind).
+struct Pool {
+    tx: Option<SyncSender<Job>>,
+    threads: Vec<JoinHandle<()>>,
+    state: Arc<PoolState>,
+}
+
+struct PoolState {
+    pending: Mutex<usize>,
+    idle: Condvar,
+    error: Mutex<Option<Error>>,
+    warnings: Mutex<Vec<String>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Pool {
+    fn new(threads: usize, cancel: Arc<AtomicBool>) -> Self {
+        // Bounded: at most this many buffered entries (≤ 1 MiB each) wait.
+        let (tx, rx) = mpsc::sync_channel::<Job>(64);
+        let rx = Arc::new(Mutex::new(rx));
+        let state = Arc::new(PoolState {
+            pending: Mutex::new(0),
+            idle: Condvar::new(),
+            error: Mutex::new(None),
+            warnings: Mutex::new(Vec::new()),
+            cancel,
+        });
+        let threads = (0..threads)
+            .map(|_| {
+                let (rx, state) = (rx.clone(), state.clone());
+                std::thread::spawn(move || work(&rx, &state))
+            })
+            .collect();
+        Self {
+            tx: Some(tx),
+            threads,
+            state,
+        }
+    }
+
+    fn submit(&mut self, job: Job) -> Result<()> {
+        self.check()?;
+        *self.state.pending.lock().unwrap() += 1;
+        let sent = self.tx.as_ref().is_some_and(|tx| tx.send(job).is_ok());
+        if !sent {
+            return Err(io::Error::other("writer threads stopped").into());
+        }
+        Ok(())
+    }
+
+    /// Returns the first writer error, if any.
+    fn check(&self) -> Result<()> {
+        match self.state.error.lock().unwrap().take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Blocks until every queued file is written.
+    fn wait(&self) -> Result<()> {
+        let mut pending = self.state.pending.lock().unwrap();
+        while *pending > 0 {
+            pending = self.state.idle.wait(pending).unwrap();
+        }
+        drop(pending);
+        self.check()
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.tx = None;
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+        self.check()
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+fn work(rx: &Mutex<Receiver<Job>>, state: &PoolState) {
+    loop {
+        let job = rx.lock().unwrap().recv();
+        let Ok(job) = job else { return };
+        let stopped = state.cancel.load(Ordering::Relaxed) || state.error.lock().unwrap().is_some();
+        if !stopped {
+            match job() {
+                Ok(None) => {}
+                Ok(Some(w)) => state.warnings.lock().unwrap().push(w),
+                Err(e) => {
+                    state.error.lock().unwrap().get_or_insert(e);
+                }
+            }
+        }
+        let mut pending = state.pending.lock().unwrap();
+        *pending -= 1;
+        if *pending == 0 {
+            state.idle.notify_all();
+        }
+    }
+}
+
 /// Creates `dir` (which must lie under `dest`) one component at a time,
 /// refusing to pass through symlinks or files planted by earlier entries.
 pub(crate) fn make_dirs(dest: &Path, dir: &Path) -> Result<()> {
@@ -83,22 +460,8 @@ pub(crate) fn make_dirs(dest: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Resolves where entry `name` goes. `None` = skip (exists and policy is Skip).
-pub(crate) fn output_path(dest: &Path, name: &str, ow: Overwrite) -> Result<Option<PathBuf>> {
-    let path = safe_path::join(dest, name)?;
-    make_dirs(dest, path.parent().unwrap_or(dest))?;
-    if fs::symlink_metadata(&path).is_err() {
-        return Ok(Some(path));
-    }
-    Ok(match ow {
-        Overwrite::Skip => None,
-        Overwrite::Replace => Some(path),
-        Overwrite::Rename => Some(unique(&path)),
-    })
-}
-
-/// `name.ext` → `name (1).ext`, `name (2).ext`, … first one that doesn't exist.
-fn unique(path: &Path) -> PathBuf {
+/// `name.ext` → `name (1).ext`, `name (2).ext`, … first one that is free.
+fn unique(path: &Path, claimed: &HashSet<PathBuf>) -> PathBuf {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     let ext = path
         .extension()
@@ -106,7 +469,7 @@ fn unique(path: &Path) -> PathBuf {
         .unwrap_or_default();
     (1..)
         .map(|n| path.with_file_name(format!("{stem} ({n}){ext}")))
-        .find(|p| fs::symlink_metadata(p).is_err())
+        .find(|p| !claimed.contains(p) && fs::symlink_metadata(p).is_err())
         .expect("unbounded range")
 }
 
