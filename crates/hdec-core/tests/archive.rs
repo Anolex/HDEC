@@ -1344,3 +1344,37 @@ fn zip_big_files_deflate_in_parallel() {
         }
     }
 }
+
+#[test]
+fn bzip2_streams_round_trip_in_parallel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("data.bin");
+    // Several 900 kB streams, plus a run that expands well past its packed size.
+    let mut data: Vec<u8> = (0..3_000_000u32)
+        .map(|i| ((i % 251) ^ (i >> 9)) as u8)
+        .collect();
+    data.extend(std::iter::repeat_n(7u8, 2_000_000));
+    fs::write(&src, &data).unwrap();
+    let cancel = AtomicBool::new(false);
+    let c = ctx(None, &cancel);
+    let archive = tmp.path().join("data.bin.bz2");
+    let opts = CreateOptions {
+        format: Format::Bz2,
+        level: Level::Max,
+        ..Default::default()
+    };
+    hdec_core::create(std::slice::from_ref(&src), &archive, &opts, &c).unwrap();
+    let packed = fs::read(&archive).unwrap();
+    assert!(packed.windows(4).filter(|w| w == b"BZh9").count() >= 5);
+    let out = tmp.path().join("out");
+    extract(&archive, &out, None).unwrap();
+    assert!(fs::read(out.join("data.bin")).unwrap() == data);
+
+    // A damaged stream in the middle fails the whole extraction.
+    let mut bad = packed.clone();
+    let second = bad.windows(4).rposition(|w| w == b"BZh9").unwrap();
+    bad[second + 20] ^= 0xFF;
+    let bad_archive = tmp.path().join("bad.bin.bz2");
+    fs::write(&bad_archive, bad).unwrap();
+    assert!(hdec_core::test(&bad_archive, &c).is_err());
+}

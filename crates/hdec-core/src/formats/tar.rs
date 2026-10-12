@@ -1,6 +1,6 @@
 //! TAR and compressed TAR (gz, bz2, xz, zst).
 
-use super::stream::{Encoder, decoder};
+use super::stream::{Encoder, decode_ahead, decoder};
 use crate::fs::{self as hfs, Extractor, OutFile};
 use crate::volume::Volume;
 use crate::{CountingRead, CreateOptions, Ctx, Entry, ExtractOptions, Format, Meter, Result};
@@ -80,7 +80,7 @@ pub fn extract(
         inner: file,
         count: &consumed,
     });
-    crate::read_ahead(decoder(format, input)?, |r| {
+    decode_ahead(format, input, |r| {
         let mut archive = tar::Archive::new(r);
         let mut x = dest
             .map(|d| Extractor::new(d, opts.overwrite, ctx))

@@ -660,35 +660,49 @@ fn ordered_parallel<T: Send>(
 /// Runs a decoder on its own thread, a few chunks ahead of `f`, so
 /// decompression overlaps with whatever `f` does with the data.
 fn read_ahead<T>(mut r: impl Read + Send, f: impl FnOnce(&mut ChunkReader) -> T) -> T {
-    const CHUNK: usize = 1 << 20;
-    let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<Vec<u8>>>(4);
-    std::thread::scope(|s| {
-        s.spawn(move || {
+    feed(
+        move |tx| {
             loop {
-                let mut buf = vec![0; CHUNK];
-                let mut n = 0;
-                let result = loop {
-                    match r.read(&mut buf[n..]) {
-                        Ok(0) => break Ok(()),
-                        Ok(k) => {
-                            n += k;
-                            if n == CHUNK {
-                                break Ok(());
-                            }
+                match read_chunk(&mut r, 1 << 20) {
+                    Ok(c) if c.is_empty() => return,
+                    chunk => {
+                        let failed = chunk.is_err();
+                        // A gone receiver: the consumer stopped (done, error or cancel).
+                        if tx.send(chunk).is_err() || failed {
+                            return;
                         }
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                        Err(e) => break Err(e),
                     }
-                };
-                buf.truncate(n);
-                let last = n < CHUNK || result.is_err();
-                let msg = result.map(|()| buf);
-                // A gone receiver means the consumer stopped (done, error or cancel).
-                if tx.send(msg).is_err() || last {
-                    return;
                 }
             }
-        });
+        },
+        f,
+    )
+}
+
+/// Up to `size` bytes; fewer only at the end.
+fn read_chunk(r: &mut impl Read, size: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0; size];
+    let mut n = 0;
+    while n < size {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    buf.truncate(n);
+    Ok(buf)
+}
+
+type ChunkSender = std::sync::mpsc::SyncSender<io::Result<Vec<u8>>>;
+
+/// Runs `produce` on its own thread; `f` reads what it sends, in order,
+/// until it returns (dropping the sender = end of data).
+fn feed<T>(produce: impl FnOnce(ChunkSender) + Send, f: impl FnOnce(&mut ChunkReader) -> T) -> T {
+    let (tx, rx) = std::sync::mpsc::sync_channel(4);
+    std::thread::scope(|s| {
+        s.spawn(move || produce(tx));
         f(&mut ChunkReader {
             rx,
             chunk: Vec::new(),
@@ -709,9 +723,6 @@ impl Read for ChunkReader {
             match self.rx.recv() {
                 Ok(chunk) => (self.chunk, self.pos) = (chunk?, 0),
                 Err(_) => return Ok(0), // producer finished
-            }
-            if self.chunk.is_empty() {
-                return Ok(0);
             }
         }
         let n = buf.len().min(self.chunk.len() - self.pos);

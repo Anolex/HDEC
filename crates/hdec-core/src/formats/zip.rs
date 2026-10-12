@@ -379,7 +379,7 @@ fn deflate_big(item: &hfs::Source, name: &str, level: u32, meter: &mut Meter) ->
     let mut tmp = tempfile::tempfile()?;
     let header_len = local(0, 0, 0).len() as u64;
     tmp.write_all(&local(0, 0, 0))?;
-    let mut enc = super::stream::ParDeflate::new(BufWriter::new(&tmp), level);
+    let mut enc = super::stream::ParEncoder::deflate(BufWriter::new(&tmp), level);
     meter.copy(name, &mut File::open(&item.path)?, &mut enc)?;
     let (out, crc, size) = enc.finish()?;
     out.into_inner().map_err(|e| e.into_error())?;
