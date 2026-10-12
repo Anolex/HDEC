@@ -638,7 +638,13 @@ fn split_volumes_round_trip() {
 
 #[test]
 fn modify_add_delete_rename() {
-    for format in [Format::Zip, Format::SevenZ, Format::Tar, Format::TarXz] {
+    for format in [
+        Format::Zip,
+        Format::SevenZ,
+        Format::Rar,
+        Format::Tar,
+        Format::TarXz,
+    ] {
         let (tmp, _, archive) = create(format, Level::Normal, false, None);
         assert!(hdec_core::modifiable(&archive));
         let cancel = AtomicBool::new(false);
@@ -1070,7 +1076,13 @@ fn modifies_info_zip_archives() {
 
 #[test]
 fn modify_adds_folder_trees() {
-    for format in [Format::Zip, Format::SevenZ, Format::Tar, Format::TarXz] {
+    for format in [
+        Format::Zip,
+        Format::SevenZ,
+        Format::Rar,
+        Format::Tar,
+        Format::TarXz,
+    ] {
         let (tmp, _, archive) = create(format, Level::Normal, false, None);
         let extra = tmp.path().join("extra");
         fs::create_dir_all(extra.join("one/two/empty")).unwrap();
@@ -1099,4 +1111,133 @@ fn modify_adds_folder_trees() {
         assert!(got.join("one/two/empty").is_dir(), "{format:?}");
         assert!(out.join("tree/sub/deeper/big.bin").is_file(), "{format:?}");
     }
+}
+
+#[test]
+fn rar_round_trips() {
+    for level in [Level::Store, Level::Fast, Level::Normal, Level::Max] {
+        let (tmp, src, archive) = create(Format::Rar, level, false, None);
+        let out = tmp.path().join("x");
+        assert!(extract(&archive, &out, None).unwrap().is_empty());
+        assert_eq!(snapshot(&out.join("tree")), snapshot(&src), "{level:?}");
+        let cancel = AtomicBool::new(false);
+        hdec_core::test(&archive, &ctx(None, &cancel)).unwrap();
+        let entries = hdec_core::list(&archive, &ctx(None, &cancel)).unwrap();
+        assert!(entries.iter().any(|e| e.path == "tree/empty" && e.is_dir));
+        assert!(hdec_core::modifiable(&archive));
+    }
+}
+
+#[test]
+fn rar_keeps_modification_time() {
+    let (tmp, _, archive) = create(Format::Rar, Level::Normal, false, None);
+    let out = tmp.path().join("x");
+    extract(&archive, &out, None).unwrap();
+    let got = fs::metadata(out.join("tree/a.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(
+        got,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000)
+    );
+}
+
+#[test]
+fn rar_passwords_encrypt_names_too() {
+    let (tmp, src, archive) = create(Format::Rar, Level::Normal, false, Some("pässword"));
+    let cancel = AtomicBool::new(false);
+    assert!(matches!(
+        hdec_core::list(&archive, &ctx(None, &cancel)),
+        Err(Error::PasswordRequired)
+    ));
+    assert!(matches!(
+        hdec_core::list(&archive, &ctx(Some("nope"), &cancel)),
+        Err(Error::WrongPassword)
+    ));
+    let out = tmp.path().join("y");
+    extract(&archive, &out, Some("pässword")).unwrap();
+    assert_eq!(snapshot(&out.join("tree")), snapshot(&src));
+    assert!(
+        !fs::read(&archive)
+            .unwrap()
+            .windows(5)
+            .any(|w| w == b"a.txt")
+    );
+
+    // Edits keep the password.
+    let c = ctx(Some("pässword"), &cancel);
+    hdec_core::modify(
+        &archive,
+        &hdec_core::Edit::Delete(vec!["tree/a.txt".into()]),
+        &c,
+    )
+    .unwrap();
+    assert!(matches!(
+        hdec_core::list(&archive, &ctx(None, &cancel)),
+        Err(Error::PasswordRequired)
+    ));
+    let names: Vec<_> = hdec_core::list(&archive, &c)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.path)
+        .collect();
+    assert!(!names.contains(&"tree/a.txt".to_string()) && names.contains(&"tree/sub".to_string()));
+}
+
+#[test]
+fn edits_existing_rar_files() {
+    let cancel = AtomicBool::new(false);
+    for (name, password) in [
+        ("rar4.rar", None),
+        ("rar5_solid_pw.rar", Some("secret")),
+        ("rar5_headers_pw.rar", Some("secret")),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join(name);
+        fs::copy(fixture(name), &archive).unwrap();
+        assert!(hdec_core::modifiable(&archive), "{name}");
+        let c = ctx(password, &cancel);
+        hdec_core::modify(
+            &archive,
+            &hdec_core::Edit::Rename(vec![("tree/a.txt".into(), "tree/renamed.txt".into())]),
+            &c,
+        )
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let out = tmp.path().join("x");
+        extract(&archive, &out, password).unwrap();
+        assert_eq!(
+            fs::read(out.join("tree/renamed.txt")).unwrap(),
+            b"hello",
+            "{name}"
+        );
+        assert_eq!(
+            fs::read(out.join("tree/sub/b.txt")).unwrap(),
+            b"world",
+            "{name}"
+        );
+        assert!(!out.join("tree/a.txt").exists(), "{name}");
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("hdec"))
+            .collect();
+        assert!(leftovers.is_empty(), "{name}: {leftovers:?}");
+    }
+    assert!(!hdec_core::modifiable(&fixture("rar5_vol.part1.rar")));
+
+    // rar5.rar holds a symlink escaping the archive: edits are refused, file untouched.
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("rar5.rar");
+    fs::copy(fixture("rar5.rar"), &archive).unwrap();
+    let r = hdec_core::modify(
+        &archive,
+        &hdec_core::Edit::Delete(vec!["tree/a.txt".into()]),
+        &ctx(None, &cancel),
+    );
+    assert!(matches!(r, Err(Error::Unsupported(_))), "{r:?}");
+    assert_eq!(
+        fs::read(&archive).unwrap(),
+        fs::read(fixture("rar5.rar")).unwrap()
+    );
 }

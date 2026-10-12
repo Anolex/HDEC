@@ -1,4 +1,4 @@
-//! RAR 1.3–7 (read-only) via `rars`.
+//! RAR via `rars`: reads RAR 1.3–7, writes RAR5.
 
 use crate::fs::{self as hfs, OutFile};
 use crate::volume::{self, Volume};
@@ -343,6 +343,121 @@ pub fn extract(
         }
     }
     Ok(warnings)
+}
+
+/// True for a RAR that isn't one part of a multi-volume set.
+pub fn single(path: &Path) -> bool {
+    volume_paths(path).len() == 1
+}
+
+/// Refuses archives `modify` shouldn't rewrite: volumes and archives locked by their creator.
+pub fn check_editable(path: &Path, ctx: &Ctx) -> Result<()> {
+    for archive in open(path, ctx)? {
+        let (volume, locked) = match &archive {
+            Archive::Rar50Plus(a) => (a.main.is_volume(), a.main.is_locked()),
+            // RAR 1.5–4: MHD_LOCK = 0x0004.
+            Archive::Rar15To40(a) => (a.main.is_volume(), a.main.flags & 0x0004 != 0),
+            Archive::Rar13(a) => (a.main.is_volume(), false),
+            _ => return Err(Error::Unsupported("unknown RAR version".into())),
+        };
+        if volume {
+            return Err(Error::Unsupported(
+                "multi-volume RAR sets can't be edited".into(),
+            ));
+        }
+        if locked {
+            return Err(Error::Unsupported(
+                "this RAR is locked by its creator against changes".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Writes RAR5: non-solid, AES-256 with encrypted headers when a password is set.
+pub fn create(
+    sources: &[PathBuf],
+    dest: &Path,
+    opts: &crate::CreateOptions,
+    ctx: &Ctx,
+) -> Result<()> {
+    use crate::Level;
+    let mut b = rars::Builder::new(rars::ArchiveVersion::Rar50);
+    b = match opts.level {
+        Level::Store => b.store(true),
+        Level::Fast => b.compression_level(Some(1)),
+        Level::Normal => b.compression_level(Some(3)),
+        Level::Max => b.compression_level(Some(5)),
+    };
+    if let Some(pw) = ctx.password {
+        b = b
+            .password(Some(pw.as_bytes().to_vec()))
+            .header_encryption(true);
+    }
+    let unix_time = |t: io::Result<SystemTime>| {
+        t.ok()
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs().min(u64::from(u32::MAX)) as u32)
+    };
+    let mut total = 0;
+    for item in hfs::walk(sources)? {
+        let name = item.name.into_bytes();
+        let mtime = unix_time(item.meta.modified());
+        let mode = hfs::mode(&item.meta);
+        let added = if item.meta.is_symlink() {
+            let target = std::fs::read_link(&item.path)?;
+            let target = target.to_string_lossy().replace('\\', "/").into_bytes();
+            b.add_unix_symlink(name, target, false, mtime, Some(0o777))
+        } else if item.meta.is_dir() {
+            b.add_directory(name, mtime, mode)
+        } else {
+            total += item.meta.len();
+            let source = rars::EntrySource::from_path(&item.path);
+            b.add_source(name, source, mtime, mode)
+        };
+        added.map_err(|e| map_err(e, ctx))?;
+    }
+    let progress = WriteProgress {
+        ctx,
+        total,
+        name: std::sync::Mutex::new(String::new()),
+    };
+    b.write_to_path(dest, Some(&progress))
+        .map_err(|e| map_err(e, ctx))
+}
+
+struct WriteProgress<'a> {
+    ctx: &'a Ctx<'a>,
+    total: u64,
+    name: std::sync::Mutex<String>,
+}
+
+impl rars::WriteProgress for WriteProgress<'_> {
+    fn report(&self, event: rars::WriteProgressEvent<'_>) {
+        let mut name = self.name.lock().unwrap();
+        match event {
+            rars::WriteProgressEvent::EntryStarted { name: n, .. } => {
+                *name = String::from_utf8_lossy(n).into_owned();
+            }
+            rars::WriteProgressEvent::Advanced {
+                completed_bytes,
+                total_bytes,
+                ..
+            } => {
+                let total = if total_bytes > 0 {
+                    total_bytes
+                } else {
+                    self.total
+                };
+                (self.ctx.progress)(completed_bytes.min(total), total, &name);
+            }
+            _ => {}
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.ctx.cancel.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]

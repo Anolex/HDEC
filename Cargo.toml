@@ -21,7 +21,7 @@ sevenz-rust2 = { version = "0.24.0", default-features = false, features = ["aes2
 tempfile = "3"
 crc32fast = "1.5"
 # read-only: never enable `write` (we don't create RAR)
-rars = { version = "0.10.0", default-features = false, features = ["encryption"] }
+rars = { version = "0.10.0", default-features = false, features = ["encryption", "write"] }
 eframe = "0.36.2"
 egui_extras = "0.36.2"
 rfd = "0.17.2"

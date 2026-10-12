@@ -103,7 +103,7 @@ impl Format {
     }
 
     pub fn encryptable(self) -> bool {
-        matches!(self, Format::Zip | Format::SevenZ)
+        matches!(self, Format::Zip | Format::SevenZ | Format::Rar)
     }
 
     /// File extension without the leading dot.
@@ -280,6 +280,7 @@ pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx)
     match opts.format {
         Format::Zip => formats::zip::create(sources, dest, opts, ctx),
         Format::SevenZ => formats::sevenz::create(sources, dest, opts, ctx),
+        Format::Rar => formats::rar::create(sources, dest, opts, ctx),
         Format::Tar | Format::TarGz | Format::TarXz | Format::TarBz2 => {
             formats::tar::create(sources, dest, opts, ctx)
         }
@@ -299,15 +300,19 @@ pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx)
 pub fn modifiable(path: &Path) -> bool {
     volume::base_path(path).is_none()
         && !is_exe(path)
-        && matches!(
-            detect(path),
-            Ok(Format::Zip
-                | Format::SevenZ
-                | Format::Tar
-                | Format::TarGz
-                | Format::TarXz
-                | Format::TarBz2)
-        )
+        && match detect(path) {
+            Ok(Format::Rar) => formats::rar::single(path),
+            Ok(f) => matches!(
+                f,
+                Format::Zip
+                    | Format::SevenZ
+                    | Format::Tar
+                    | Format::TarGz
+                    | Format::TarXz
+                    | Format::TarBz2
+            ),
+            Err(_) => false,
+        }
 }
 
 /// Applies `edit`, replacing the archive only once the new one is complete.
@@ -321,6 +326,10 @@ pub fn modify(path: &Path, edit: &Edit, ctx: &Ctx) -> Result<()> {
     check_edit(edit, &names_with_parents(&list(path, ctx)?))?;
     match detect(path)? {
         Format::Zip => formats::zip::modify(path, edit, ctx),
+        Format::Rar => {
+            formats::rar::check_editable(path, ctx)?;
+            rewrite(path, Format::Rar, edit, ctx)
+        }
         format => rewrite(path, format, edit, ctx),
     }
 }
@@ -371,13 +380,15 @@ fn check_edit(edit: &Edit, existing: &std::collections::BTreeSet<String>) -> Res
     Ok(())
 }
 
-/// Generic modify: extract next to the archive, edit the files, re-create.
+/// Generic modify: extract next to the archive, edit the files, re-create, test
+/// the new archive, and only then replace the old one.
 /// ponytail: recompresses everything at Normal level; ZIP has a raw-copy path instead.
 fn rewrite(path: &Path, format: Format, edit: &Edit, ctx: &Ctx) -> Result<()> {
     let scratch = tempfile::Builder::new()
         .prefix(".hdec-edit")
         .tempdir_in(path.parent().unwrap_or(Path::new(".")))?;
-    let root = scratch.path();
+    let root = &scratch.path().join("files");
+    std::fs::create_dir(root)?;
     let warnings = extract(path, root, &ExtractOptions::default(), ctx)?;
     if let Some(w) = warnings.first() {
         return Err(Error::Unsupported(format!(
@@ -426,7 +437,17 @@ fn rewrite(path: &Path, format: Format, edit: &Edit, ctx: &Ctx) -> Result<()> {
         format,
         ..Default::default()
     };
-    create(&sources, path, &opts, ctx)
+    // Same file name, so detection by extension (tar.gz vs gz) still works.
+    let rebuilt = scratch.path().join(path.file_name().unwrap_or_default());
+    create(&sources, &rebuilt, &opts, ctx)?;
+    test(&rebuilt, ctx).map_err(|e| match e {
+        Error::Cancelled => e,
+        e => Error::Corrupt(format!(
+            "the rebuilt archive failed its check, nothing was changed: {e}"
+        )),
+    })?;
+    std::fs::rename(&rebuilt, path)?;
+    Ok(())
 }
 
 fn is_selected(name: &str, only: Option<&[String]>) -> bool {

@@ -11,12 +11,13 @@ Cross-platform GUI archiver for macOS (arm64, x86_64) and Windows (x64, arm64), 
 | 7Z | LZMA2 levels, AES-256, encrypt file names, solid on/off | `sevenz-rust2` (uses `lzma-rust2`) |
 | TAR, TAR.GZ, TAR.XZ, TAR.BZ2 | level | `tar` + `flate2`, `lzma-rust2`, `bzip2` (Rust backend) |
 | GZ, XZ, BZ2 | single file only | same |
+| RAR (RAR5) | Store + levels 1/3/5, AES-256 with encrypted headers, non-solid | `rars` writer (clean-room, Apache-2.0) |
 
 ### Extract / list / test
 Everything above, plus:
 | Format | Crate / note |
 |---|---|
-| RAR 1.3–7 (incl. encrypted, encrypted headers, multi-volume `.partN.rar` / `.rNN`) | `rars` (pure Rust, Apache-2.0), read-only features |
+| RAR 1.3–7 (incl. encrypted, encrypted headers, multi-volume `.partN.rar` / `.rNN`) | `rars` (pure Rust, Apache-2.0) |
 | ZIP methods Deflate64, BZip2, LZMA, XZ, PPMd (Zstd deferred: rare in ZIP, needs a raw-read path because `zip`'s zstd feature is C) | `zip` features |
 | ZST, TAR.ZST, LZMA, LZ, TAR.LZ | `ruzstd`, `lzma-rust2` |
 | JAR, APK, XPI, EPUB, … | ZIP, detected by magic bytes |
@@ -25,7 +26,7 @@ Everything above, plus:
 ### Encryption
 - ZIP: AES-256 (WinZip AE-2) read/write; ZipCrypto read/write (warn: weak, but the only kind Explorer/Archive Utility open).
 - 7Z: AES-256 + SHA-256 KDF, optional header encryption.
-- RAR: RAR3 AES-128, RAR5 AES-256 + PBKDF2-HMAC-SHA256 (read only).
+- RAR: RAR3 AES-128, RAR5 AES-256 + PBKDF2-HMAC-SHA256; writes RAR5 AES-256 with encrypted headers.
 
 ### Split volumes
 - Write: byte-split any created archive into `name.ext.001`, `.002`, … (presets: 100 MB, 700 MB, 4 GB FAT32, custom).
@@ -34,8 +35,8 @@ Everything above, plus:
 ### Modify
 Add / delete / rename entries. Always written to a temp file next to the original, then atomically renamed.
 - ZIP: raw-copy unchanged entries (no recompression).
-- 7Z, TAR family: full rewrite.
-- RAR: read-only (creating RAR is forbidden by the unRAR license and not a goal).
+- 7Z, TAR family, RAR: full rewrite (extract, edit, re-create), then `test` the rebuilt archive before it replaces the old one.
+- RAR: multi-volume sets and archives locked by their creator are refused; edits write RAR5 (RAR4 input becomes RAR5); comments and recovery records are not kept.
 
 ### Out of scope (decided)
 ACE, ARJ, BH, PMA, ALZ, EGG, PEA, ZPAQ (dead / single-vendor) · UU/UUE/XXE, AES Crypt (not archives) · ISO, IMG, BIN, UDF, DAA, ISZ, WIM, MSI, NSIS, ASAR (images/installers) · LZH, ZIPX, SFX creation · Zstd creation (pure-Rust encoder too weak; revisit when `ruzstd` matures).
@@ -115,7 +116,7 @@ Each phase ends with: `cargo fmt --check`, `cargo clippy --all-targets -- -D war
 | P9 🟡 | Release | done: CI (macOS + Windows: fmt, clippy, tests, no-C check), release profile, no console window on Windows. Todo: icon, macOS .app + handling Finder "open document" Apple Events (winit doesn't forward them), Windows installer with file associations + Explorer verbs, signing + notarization | signed installers install and open archives by double-click |
 
 ### RAR notes
-- Found `rars` (crates.io, Apache-2.0, pure Rust) after planning: reads RAR 1.3 through 7. We use it with `default-features = false, features = ["encryption"]`, so no RAR encoder is compiled in.
+- Found `rars` (crates.io, Apache-2.0, pure Rust) after planning: reads RAR 1.3 through 7. We use it with `default-features = false, features = ["encryption", "write"]`; `write` only adds `getrandom` (pure Rust).
 - Risk: young crate ("agentic development experiment" per its README). Mitigation: our fixtures, real-WinRAR fixtures once available, and fuzzing if bugs show up.
 - `extract_to` skips RAR5 redirections; `formats/rar.rs` recreates symlinks from member metadata (hard links/junctions/file copies are reported as skipped).
 
@@ -143,6 +144,7 @@ Each phase ends with: `cargo fmt --check`, `cargo clippy --all-targets -- -D war
 | Notarization / Authenticode need paid certs | needed only at P9 |
 
 ## 8. Decisions log
+- 2026-10-12: RAR create and edit via `rars`' writer. The earlier "read-only" rule was over-cautious: the unRAR *source* license forbids using that code to build a RAR creator, and HDEC uses none of it; `rars` is an independent implementation. Every full rewrite (7Z, TAR, RAR) now tests the rebuilt archive before replacing the original.
 - 2026-10-12: Edits are staged: the first edit copies the archive to a temp dir and every edit applies to that copy (which is also what's listed, extracted and previewed). Save (⌘S/Ctrl+S) writes it back via `*.hdec-tmp` + rename; opening another archive or closing the window with unsaved edits asks Save / Don't save / Cancel. Default window 728×448. New archive takes a name + folder instead of a full path.
 - 2026-10-12: Folders are added recursively (create and modify). One picker for files and folders together (double-click opens a folder, Open takes the selection): macOS uses NSOpenPanel via rfd `pick_files_or_folders`; Windows' native dialog can't mix them, so it gets the in-app `picker.rs`. The New archive dialog lists its contents, which can be removed, extended via Add… or by dropping onto the window.
 - 2026-10-12: Files opened from an archive are watched (mtime, polled every second); a change prompts to save it back via `Edit::Add` into the entry's folder. Read-only archives (RAR, split, SFX, single streams) show a "Read-only" badge and say why on hover.

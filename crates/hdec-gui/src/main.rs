@@ -20,6 +20,7 @@ use zeroize::Zeroizing;
 const CREATE_FORMATS: &[Format] = &[
     Format::Zip,
     Format::SevenZ,
+    Format::Rar,
     Format::Tar,
     Format::TarGz,
     Format::TarXz,
@@ -2070,7 +2071,7 @@ fn create_form(ui: &mut egui::Ui, form: &mut CreateForm) -> Option<bool> {
                             (_, _, true) => {
                                 RichText::new("Leave empty for no encryption.").color(p.faint)
                             }
-                            (Format::SevenZ, ..) => {
+                            (Format::SevenZ | Format::Rar, ..) => {
                                 RichText::new("AES-256. File names are encrypted too.")
                                     .color(p.faint)
                             }
@@ -2275,7 +2276,7 @@ fn read_only_reason(path: &Path, format: &str) -> &'static str {
     } else if ext == "exe" {
         "Self-extracting archives are read-only."
     } else if format == "RAR" {
-        "RAR archives are read-only: the RAR license forbids creating RAR files. Extract and re-pack as 7Z or ZIP to edit."
+        "Multi-volume RAR sets (.part1.rar, .r00) are read-only. Extract them to edit."
     } else if matches!(format, "GZ" | "XZ" | "BZ2" | "ZST" | "LZ" | "LZMA") {
         "This is a single compressed file, not an archive of files."
     } else {
