@@ -387,6 +387,7 @@ impl Pool {
         *self.state.pending.lock().unwrap() += 1;
         let sent = self.tx.as_ref().is_some_and(|tx| tx.send(job).is_ok());
         if !sent {
+            *self.state.pending.lock().unwrap() -= 1;
             return Err(io::Error::other("writer threads stopped").into());
         }
         Ok(())

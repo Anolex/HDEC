@@ -398,11 +398,12 @@ pub(crate) struct ParEncoder<W: Write> {
     max_in_flight: u64,
 }
 
-struct ChunkJob {
-    id: u64,
-    data: Vec<u8>,
-    dict: Vec<u8>,
-    last: bool,
+pub(crate) struct ChunkJob {
+    pub id: u64,
+    pub data: Vec<u8>,
+    /// Deflate only: the input just before `data`.
+    pub dict: Vec<u8>,
+    pub last: bool,
 }
 
 type ChunkFn = fn(&ChunkJob, u32) -> io::Result<Vec<u8>>;
@@ -522,7 +523,7 @@ fn bzip2_chunk(job: &ChunkJob, level: u32) -> io::Result<Vec<u8>> {
     e.finish()
 }
 
-fn deflate_chunk(job: &ChunkJob, level: u32) -> io::Result<Vec<u8>> {
+pub(crate) fn deflate_chunk(job: &ChunkJob, level: u32) -> io::Result<Vec<u8>> {
     use flate2::{Compress, Compression, FlushCompress, Status};
     let mut c = Compress::new(Compression::new(level), false);
     if !job.dict.is_empty() {

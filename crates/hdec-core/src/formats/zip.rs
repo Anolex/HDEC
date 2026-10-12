@@ -4,7 +4,7 @@ use crate::{CreateOptions, Ctx, Edit, Entry, Error, ExtractOptions, Level, Meter
 use jiff::tz::TimeZone;
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -263,6 +263,26 @@ fn finish(w: Writer) -> Result<()> {
 /// split across all cores by `deflate_big`. Bounds memory: 16 per thread wait.
 const PARALLEL_MAX: u64 = 1 << 20;
 
+/// One unit of work for `add_items`.
+enum Job {
+    /// A whole item: compressed by a worker if small, else written by the consumer.
+    Item(usize),
+    /// 1 MiB of a big file, deflated by a worker (pigz-style, see `deflate_chunk`).
+    Chunk {
+        item: usize,
+        offset: u64,
+        last: bool,
+    },
+}
+
+enum Packed {
+    Whole(Vec<u8>),
+    Chunk(Vec<u8>, crc32fast::Hasher, u64),
+    Later,
+}
+
+const CHUNK: u64 = 1 << 20;
+
 fn add_items(
     w: &mut Writer,
     items: &[hfs::Source],
@@ -293,131 +313,228 @@ fn add_items(
     let entry_options =
         |item: &hfs::Source| entry_options(base, item, ctx.password, opts.zip_crypto);
     // ZipCrypto entries don't survive `raw_copy_file` (zip 9.0.1): legacy, so serial.
-    let parallel = |item: &hfs::Source| {
+    let whole = |item: &hfs::Source| {
         !opts.zip_crypto && item.meta.is_file() && item.meta.len() <= PARALLEL_MAX
     };
-    let compress = |i: usize| -> Result<Option<Vec<u8>>> {
-        let item = &items[i];
-        if !parallel(item) {
-            return Ok(None);
+    // Big unencrypted files are cut into chunks that join into one deflate stream.
+    let chunked = |item: &hfs::Source| {
+        deflate_level.is_some()
+            && ctx.password.is_none()
+            && item.meta.is_file()
+            && item.meta.len() > PARALLEL_MAX
+    };
+    let mut jobs = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        if chunked(item) {
+            let len = item.meta.len();
+            jobs.extend((0..len.div_ceil(CHUNK)).map(|k| Job::Chunk {
+                item: i,
+                offset: k * CHUNK,
+                last: (k + 1) * CHUNK >= len,
+            }));
+        } else {
+            jobs.push(Job::Item(i));
         }
+    }
+    let work = |j: usize| -> Result<Packed> {
         ctx.check()?;
-        let name = format!("{prefix}{}", item.name);
-        let mut one = ZipWriter::new(io::Cursor::new(Vec::with_capacity(
-            item.meta.len() as usize / 2 + 256,
-        )));
-        one.start_file(&name, entry_options(item)?)?;
-        let mut file = File::open(&item.path)?;
-        meter.fork().copy(&name, &mut file, &mut one)?;
-        Ok(Some(one.finish()?.into_inner()))
+        match jobs[j] {
+            Job::Item(i) if whole(&items[i]) => {
+                let item = &items[i];
+                let name = format!("{prefix}{}", item.name);
+                let mut one = ZipWriter::new(io::Cursor::new(Vec::with_capacity(
+                    item.meta.len() as usize / 2 + 256,
+                )));
+                one.start_file(&name, entry_options(item)?)?;
+                // Small: one read, no copy buffer.
+                let data = std::fs::read(&item.path)?;
+                one.write_all(&data)?;
+                meter.advance(data.len(), &name);
+                Ok(Packed::Whole(one.finish()?.into_inner()))
+            }
+            Job::Item(_) => Ok(Packed::Later),
+            Job::Chunk { item, offset, last } => {
+                let item = &items[item];
+                let dict_start = offset.saturating_sub(32 << 10);
+                let mut file = File::open(&item.path)?;
+                file.seek(SeekFrom::Start(dict_start))?;
+                let mut data = Vec::new();
+                file.take(offset - dict_start + CHUNK)
+                    .read_to_end(&mut data)?;
+                let split = ((offset - dict_start) as usize).min(data.len());
+                let (dict, data) = (data[..split].to_vec(), data[split..].to_vec());
+                let mut crc = crc32fast::Hasher::new();
+                crc.update(&data);
+                let len = data.len() as u64;
+                let job = super::stream::ChunkJob {
+                    id: 0,
+                    data,
+                    dict,
+                    last,
+                };
+                let packed = super::stream::deflate_chunk(&job, deflate_level.unwrap_or(6))?;
+                meter.advance(len as usize, &item.name);
+                Ok(Packed::Chunk(packed, crc, len))
+            }
+        }
     };
     let threads = all_cores();
     let mut own = meter.fork();
-    let write = |i: usize, packed: Option<Vec<u8>>| -> Result<()> {
+    let mut big: Option<BigEntry> = None;
+    let write = |j: usize, packed: Packed| -> Result<()> {
+        let (i, last) = match jobs[j] {
+            Job::Item(i) => (i, true),
+            Job::Chunk { item, last, .. } => (item, last),
+        };
         let item = &items[i];
         let name = format!("{prefix}{}", item.name);
-        if let Some(bytes) = packed {
-            let mut one = ZipArchive::new(io::Cursor::new(bytes))?;
-            return Ok(w.raw_copy_file(one.by_index_raw(0)?)?);
-        }
-        let o = entry_options(item)?;
-        if item.meta.is_dir() {
-            w.add_directory(&name, o)?;
-        } else if item.meta.is_symlink() {
-            let target = std::fs::read_link(&item.path)?;
-            w.add_symlink(&name, target.to_string_lossy(), o)?;
-        } else if let (Some(level), None) = (deflate_level, ctx.password) {
-            let one = deflate_big(item, &name, level, &mut own)?;
-            w.raw_copy_file(ZipArchive::new(one)?.by_index_raw(0)?)?;
-        } else {
-            w.start_file(&name, o)?;
-            own.copy(&name, &mut File::open(&item.path)?, w)?;
+        match packed {
+            Packed::Whole(bytes) => {
+                let mut one = ZipArchive::new(io::Cursor::new(bytes))?;
+                w.raw_copy_file(one.by_index_raw(0)?)?;
+            }
+            Packed::Chunk(data, crc, len) => {
+                let entry = match &mut big {
+                    Some(entry) => entry,
+                    None => big.insert(BigEntry::start(item, &name)?),
+                };
+                entry.push(&data, &crc, len)?;
+                if last {
+                    let one = big.take().expect("started above").finish()?;
+                    w.raw_copy_file(ZipArchive::new(one)?.by_index_raw(0)?)?;
+                }
+            }
+            Packed::Later => {
+                let o = entry_options(item)?;
+                if item.meta.is_dir() {
+                    w.add_directory(&name, o)?;
+                } else if item.meta.is_symlink() {
+                    let target = std::fs::read_link(&item.path)?;
+                    w.add_symlink(&name, target.to_string_lossy(), o)?;
+                } else {
+                    w.start_file(&name, o)?;
+                    own.copy(&name, &mut File::open(&item.path)?, w)?;
+                }
+            }
         }
         Ok(())
     };
-    crate::ordered_parallel(items.len(), threads, 16 * threads, compress, write)
+    crate::ordered_parallel(jobs.len(), threads, 16 * threads, work, write)
 }
 
-/// Deflates a big file on all cores into a one-entry ZIP64 archive in a temp
-/// file, ready for `raw_copy_file` (the zip crate can't take pre-compressed data).
-fn deflate_big(item: &hfs::Source, name: &str, level: u32, meter: &mut Meter) -> Result<File> {
-    let dos = item
-        .meta
-        .modified()
-        .ok()
-        .and_then(to_dos)
-        .unwrap_or_default();
-    let (made_by, external): (u16, u32) = match hfs::mode(&item.meta) {
-        Some(mode) => ((3 << 8) | 45, (0o100000 | mode) << 16),
-        None => (45, 0),
-    };
-    // Version 4.5 (ZIP64), UTF-8 name, deflate.
-    let common = |crc: u32| {
+/// A big file's deflate stream, wrapped as a one-entry ZIP64 archive in a temp
+/// file for `raw_copy_file` (the zip crate can't take pre-compressed data).
+struct BigEntry {
+    tmp: File,
+    name: Vec<u8>,
+    dos: zip::DateTime,
+    made_by: u16,
+    external: u32,
+    header_len: u64,
+    crc: crc32fast::Hasher,
+    size: u64,
+    packed: u64,
+}
+
+impl BigEntry {
+    fn start(item: &hfs::Source, name: &str) -> Result<Self> {
+        let (made_by, external) = match hfs::mode(&item.meta) {
+            Some(mode) => ((3 << 8) | 45, (0o100000 | mode) << 16),
+            None => (45, 0),
+        };
+        let mut entry = Self {
+            tmp: tempfile::tempfile()?,
+            name: name.as_bytes().to_vec(),
+            dos: item
+                .meta
+                .modified()
+                .ok()
+                .and_then(to_dos)
+                .unwrap_or_default(),
+            made_by,
+            external,
+            header_len: 0,
+            crc: crc32fast::Hasher::new(),
+            size: 0,
+            packed: 0,
+        };
+        let header = entry.local_header(0);
+        entry.header_len = header.len() as u64;
+        entry.tmp.write_all(&header)?;
+        Ok(entry)
+    }
+
+    fn push(&mut self, packed: &[u8], crc: &crc32fast::Hasher, len: u64) -> Result<()> {
+        self.tmp.write_all(packed)?;
+        self.crc.combine(crc);
+        self.size += len;
+        self.packed += packed.len() as u64;
+        Ok(())
+    }
+
+    /// Version 4.5 (ZIP64), UTF-8 name, deflate; sizes live in the ZIP64 field.
+    fn common(&self, crc: u32) -> Vec<u8> {
         let mut h = Vec::new();
-        for v in [45u16, 0x0800, 8, dos.timepart(), dos.datepart()] {
+        for v in [45u16, 0x0800, 8, self.dos.timepart(), self.dos.datepart()] {
             h.extend_from_slice(&v.to_le_bytes());
         }
         h.extend_from_slice(&crc.to_le_bytes());
-        h.extend_from_slice(&[0xFF; 8]); // sizes: see the ZIP64 field
-        h.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        h.extend_from_slice(&[0xFF; 8]);
+        h.extend_from_slice(&(self.name.len() as u16).to_le_bytes());
         h.extend_from_slice(&20u16.to_le_bytes());
         h
-    };
-    let zip64 = |size: u64, packed: u64| {
-        let mut e = vec![1, 0, 16, 0];
-        e.extend_from_slice(&size.to_le_bytes());
-        e.extend_from_slice(&packed.to_le_bytes());
-        e
-    };
-    let local = |crc, size, packed| {
-        let mut h = 0x04034b50u32.to_le_bytes().to_vec();
-        h.extend(common(crc));
-        h.extend_from_slice(name.as_bytes());
-        h.extend(zip64(size, packed));
-        h
-    };
-    let mut tmp = tempfile::tempfile()?;
-    let header_len = local(0, 0, 0).len() as u64;
-    tmp.write_all(&local(0, 0, 0))?;
-    let mut enc = super::stream::ParEncoder::deflate(BufWriter::new(&tmp), level);
-    meter.copy(name, &mut File::open(&item.path)?, &mut enc)?;
-    let (out, crc, size) = enc.finish()?;
-    out.into_inner().map_err(|e| e.into_error())?;
-    let packed = tmp.seek(SeekFrom::End(0))? - header_len;
-    tmp.seek(SeekFrom::Start(0))?;
-    tmp.write_all(&local(crc, size, packed))?;
-    tmp.seek(SeekFrom::End(0))?;
+    }
 
-    let mut tail = 0x02014b50u32.to_le_bytes().to_vec();
-    tail.extend_from_slice(&made_by.to_le_bytes());
-    tail.extend(common(crc));
-    tail.extend_from_slice(&[0; 6]); // comment length, disk, internal attributes
-    tail.extend_from_slice(&external.to_le_bytes());
-    tail.extend_from_slice(&0u32.to_le_bytes()); // local header offset
-    tail.extend_from_slice(name.as_bytes());
-    tail.extend(zip64(size, packed));
-    let (cd_offset, cd_size) = (header_len + packed, tail.len() as u64);
-    let eocd64 = cd_offset + cd_size;
-    tail.extend_from_slice(&0x06064b50u32.to_le_bytes());
-    tail.extend_from_slice(&44u64.to_le_bytes());
-    for v in [made_by, 45] {
-        tail.extend_from_slice(&v.to_le_bytes());
+    fn zip64(&self) -> Vec<u8> {
+        let mut e = vec![1, 0, 16, 0];
+        e.extend_from_slice(&self.size.to_le_bytes());
+        e.extend_from_slice(&self.packed.to_le_bytes());
+        e
     }
-    tail.extend_from_slice(&[0; 8]); // disk numbers
-    for v in [1, 1, cd_size, cd_offset] {
-        tail.extend_from_slice(&u64::to_le_bytes(v));
+
+    fn local_header(&self, crc: u32) -> Vec<u8> {
+        let mut h = 0x04034b50u32.to_le_bytes().to_vec();
+        h.extend(self.common(crc));
+        h.extend_from_slice(&self.name);
+        h.extend(self.zip64());
+        h
     }
-    tail.extend_from_slice(&0x07064b50u32.to_le_bytes());
-    tail.extend_from_slice(&0u32.to_le_bytes());
-    tail.extend_from_slice(&eocd64.to_le_bytes());
-    tail.extend_from_slice(&1u32.to_le_bytes());
-    tail.extend_from_slice(&0x06054b50u32.to_le_bytes());
-    tail.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
-    tail.extend_from_slice(&[0xFF; 8]); // CD size and offset: see ZIP64
-    tail.extend_from_slice(&[0, 0]);
-    tmp.write_all(&tail)?;
-    tmp.seek(SeekFrom::Start(0))?;
-    Ok(tmp)
+
+    fn finish(mut self) -> Result<File> {
+        let crc = self.crc.clone().finalize();
+        self.tmp.seek(SeekFrom::Start(0))?;
+        self.tmp.write_all(&self.local_header(crc))?;
+        self.tmp.seek(SeekFrom::End(0))?;
+        let mut tail = 0x02014b50u32.to_le_bytes().to_vec();
+        tail.extend_from_slice(&self.made_by.to_le_bytes());
+        tail.extend(self.common(crc));
+        tail.extend_from_slice(&[0; 6]); // comment length, disk, internal attributes
+        tail.extend_from_slice(&self.external.to_le_bytes());
+        tail.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        tail.extend_from_slice(&self.name);
+        tail.extend(self.zip64());
+        let (cd_offset, cd_size) = (self.header_len + self.packed, tail.len() as u64);
+        tail.extend_from_slice(&0x06064b50u32.to_le_bytes());
+        tail.extend_from_slice(&44u64.to_le_bytes());
+        for v in [self.made_by, 45] {
+            tail.extend_from_slice(&v.to_le_bytes());
+        }
+        tail.extend_from_slice(&[0; 8]); // disk numbers
+        for v in [1, 1, cd_size, cd_offset] {
+            tail.extend_from_slice(&u64::to_le_bytes(v));
+        }
+        tail.extend_from_slice(&0x07064b50u32.to_le_bytes());
+        tail.extend_from_slice(&0u32.to_le_bytes());
+        tail.extend_from_slice(&(cd_offset + cd_size).to_le_bytes());
+        tail.extend_from_slice(&1u32.to_le_bytes());
+        tail.extend_from_slice(&0x06054b50u32.to_le_bytes());
+        tail.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
+        tail.extend_from_slice(&[0xFF; 8]); // CD size and offset: see ZIP64
+        tail.extend_from_slice(&[0, 0]);
+        self.tmp.write_all(&tail)?;
+        self.tmp.seek(SeekFrom::Start(0))?;
+        Ok(self.tmp)
+    }
 }
 
 fn entry_options<'k>(
