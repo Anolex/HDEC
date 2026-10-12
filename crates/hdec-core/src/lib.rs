@@ -619,6 +619,16 @@ impl<R: io::Seek> io::Seek for CountingRead<'_, R> {
     }
 }
 
+/// Runs `f`, turning a panic into an error: a worker that dies without
+/// reporting would leave whoever waits for its result waiting forever.
+fn no_panic<T, E: From<io::Error>>(
+    f: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+        Err(io::Error::other("internal error: a worker thread panicked").into())
+    })
+}
+
 /// Runs `work(i)` for `i in 0..n` on `threads` threads and hands the results
 /// to `consume` in order, with at most `ahead` results waiting. The first
 /// error (from either side) stops everything.
@@ -658,7 +668,7 @@ fn ordered_parallel<T: Send>(
                     let i = st.next;
                     st.next += 1;
                     drop(st);
-                    let r = work(i);
+                    let r = no_panic(|| work(i));
                     let mut st = state.lock().unwrap();
                     st.stop |= r.is_err();
                     st.done.insert(i, r);

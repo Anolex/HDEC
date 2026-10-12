@@ -1378,3 +1378,90 @@ fn bzip2_streams_round_trip_in_parallel() {
     fs::write(&bad_archive, bad).unwrap();
     assert!(hdec_core::test(&bad_archive, &c).is_err());
 }
+
+#[test]
+fn colliding_names_dont_abort_extraction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("collide.tar");
+    let mut b = tar::Builder::new(fs::File::create(&archive).unwrap());
+    let mut add = |name: &str, data: &[u8], kind: tar::EntryType| {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(kind);
+        h.set_size(data.len() as u64);
+        h.set_mode(0o755);
+        b.append_data(&mut h, name, data).unwrap();
+    };
+    // Same name on case-insensitive file systems (macOS, Windows).
+    add("d/Makefile", b"upper", tar::EntryType::Regular);
+    add("d/makefile", b"lower", tar::EntryType::Regular);
+    // A file named like a folder made earlier.
+    add("d/sub/", b"", tar::EntryType::Directory);
+    add("d/sub", b"file", tar::EntryType::Regular);
+    b.into_inner().unwrap();
+    let cancel = AtomicBool::new(false);
+    for overwrite in [Overwrite::Skip, Overwrite::Replace, Overwrite::Rename] {
+        let out = tmp.path().join(format!("{overwrite:?}"));
+        let opts = ExtractOptions {
+            only: None,
+            overwrite,
+        };
+        let result = hdec_core::extract(&archive, &out, &opts, &ctx(None, &cancel));
+        assert!(result.is_ok(), "{overwrite:?}: {result:?}");
+        assert!(out.join("d/sub").is_dir(), "{overwrite:?}");
+        assert!(fs::read(out.join("d/Makefile")).is_ok(), "{overwrite:?}");
+    }
+}
+
+#[test]
+fn empty_inputs_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("empty.txt");
+    fs::write(&file, "").unwrap();
+    let dir = tmp.path().join("nothing");
+    fs::create_dir(&dir).unwrap();
+    let cancel = AtomicBool::new(false);
+    let c = ctx(None, &cancel);
+    let cases = [
+        (Format::Gz, &file),
+        (Format::Bz2, &file),
+        (Format::Xz, &file),
+        (Format::Zip, &dir),
+        (Format::SevenZ, &dir),
+        (Format::TarGz, &dir),
+        (Format::TarBz2, &dir),
+        (Format::TarXz, &dir),
+        (Format::Rar, &dir),
+    ];
+    for (format, src) in cases {
+        for level in [Level::Store, Level::Normal] {
+            // Single-file streams extract to the archive's name minus the extension.
+            let folder = tmp.path().join(format!("{level:?}"));
+            fs::create_dir_all(&folder).unwrap();
+            let stem = src.file_name().unwrap().to_string_lossy();
+            let archive = folder.join(format!("{stem}.{}", format.extension()));
+            let opts = CreateOptions {
+                format,
+                level,
+                ..Default::default()
+            };
+            hdec_core::create(std::slice::from_ref(src), &archive, &opts, &c).unwrap();
+            hdec_core::test(&archive, &c).unwrap();
+            let out = tmp
+                .path()
+                .join(format!("out-{level:?}-{}", format.extension()));
+            extract(&archive, &out, None).unwrap();
+            let name = src.file_name().unwrap();
+            let got = fs::symlink_metadata(out.join(name));
+            assert!(got.is_ok(), "{format:?} {level:?}");
+            if format.extension().contains("tar") || src == &dir {
+                assert!(got.unwrap().is_dir(), "{format:?} {level:?}");
+            } else {
+                assert_eq!(
+                    fs::read(out.join(name)).unwrap(),
+                    b"",
+                    "{format:?} {level:?}"
+                );
+            }
+        }
+    }
+}

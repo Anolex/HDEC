@@ -431,7 +431,7 @@ impl<W: Write> ParEncoder<W> {
                         let Ok(job) = rx.lock().unwrap().recv() else {
                             return;
                         };
-                        let out = compress(&job, level);
+                        let out = crate::no_panic(|| compress(&job, level));
                         if tx.send((job.id, out)).is_err() {
                             return;
                         }

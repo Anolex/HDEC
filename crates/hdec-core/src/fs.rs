@@ -49,14 +49,6 @@ impl OutFile {
         })
     }
 
-    fn new(path: PathBuf, replace: bool) -> Result<Self> {
-        if replace {
-            Self::create(path)
-        } else {
-            Self::create_new(path)
-        }
-    }
-
     pub fn file(&self) -> &File {
         &self.file
     }
@@ -113,8 +105,7 @@ pub(crate) fn writer_threads() -> usize {
 /// One extracted file being filled. `finish` sets its time and mode and
 /// commits it; dropped unfinished, nothing is left behind.
 pub(crate) struct Out {
-    path: PathBuf,
-    replace: bool,
+    target: Target,
     data: Data,
 }
 
@@ -125,24 +116,29 @@ enum Data {
 
 impl Out {
     /// `size` is the declared size (a capacity hint only; `u64::MAX` = unknown).
-    pub fn new(target: &Target, size: u64) -> Result<Self> {
+    /// `None` = skipped by the overwrite policy.
+    pub fn new(target: &Target, size: u64) -> Result<Option<Self>> {
         let data = if size <= BUFFERED {
             Data::Buf(Vec::with_capacity(size as usize))
         } else {
-            Data::File(OutFile::new(target.path.clone(), target.replace)?)
+            match target.open()? {
+                Some(f) => Data::File(f),
+                None => return Ok(None),
+            }
         };
-        Ok(Self {
-            path: target.path.clone(),
-            replace: target.replace,
+        Ok(Some(Self {
+            target: target.clone(),
             data,
-        })
+        }))
     }
 
     pub fn finish(self, modified: Option<SystemTime>, mode: Option<u32>) -> Result<()> {
         let out = match self.data {
             Data::File(f) => f,
             Data::Buf(buf) => {
-                let mut f = OutFile::new(self.path, self.replace)?;
+                let Some(mut f) = self.target.open()? else {
+                    return Ok(());
+                };
                 f.write_all(&buf)?;
                 f
             }
@@ -174,9 +170,40 @@ impl Write for Out {
 }
 
 /// Where an entry goes. `replace`: something is there and the policy is Replace.
+#[derive(Clone)]
 pub(crate) struct Target {
     pub path: PathBuf,
     replace: bool,
+    overwrite: Overwrite,
+}
+
+impl Target {
+    /// Opens the output; `None` = skipped. A name that turns up taken anyway
+    /// (case-insensitive file systems: `Makefile` vs `makefile`; a folder of
+    /// the same name) gets the overwrite policy instead of failing.
+    fn open(&self) -> Result<Option<OutFile>> {
+        if self.replace {
+            return OutFile::create(self.path.clone()).map(Some);
+        }
+        let taken = |r: &Result<OutFile>| matches!(r, Err(Error::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists);
+        let first = OutFile::create_new(self.path.clone());
+        if !taken(&first) {
+            return first.map(Some);
+        }
+        match self.overwrite {
+            Overwrite::Skip => Ok(None),
+            Overwrite::Replace => OutFile::create(self.path.clone()).map(Some),
+            Overwrite::Rename => {
+                for n in 1.. {
+                    let next = OutFile::create_new(numbered(&self.path, n));
+                    if !taken(&next) {
+                        return next.map(Some);
+                    }
+                }
+                unreachable!("unbounded range")
+            }
+        }
+    }
 }
 
 /// Extracts into `dest`: checks each folder once and hands finished files
@@ -259,22 +286,25 @@ impl Extractor {
             self.pool.wait()?;
         }
         // In a folder we created, only our own entries can exist.
-        let exists =
-            (claimed || !self.created.contains(&parent)) && fs::symlink_metadata(&path).is_ok();
-        let target = match (exists, self.overwrite) {
-            (false, _) => Target {
-                path,
-                replace: false,
-            },
-            (true, Overwrite::Skip) => return Ok(None),
-            (true, Overwrite::Replace) => Target {
-                path,
-                replace: true,
-            },
-            (true, Overwrite::Rename) => Target {
-                path: unique(&path, &self.claimed),
-                replace: false,
-            },
+        let ours = claimed || self.dirs.contains(&path);
+        let existing = (ours || !self.created.contains(&parent))
+            .then(|| fs::symlink_metadata(&path).ok())
+            .flatten();
+        let (path, replace) = match (existing, self.overwrite) {
+            (None, _) => (path, false),
+            (Some(_), Overwrite::Skip) => return Ok(None),
+            (Some(m), Overwrite::Replace) if m.is_dir() => {
+                self.warnings
+                    .push(format!("skipped {name}: a folder with that name exists"));
+                return Ok(None);
+            }
+            (Some(_), Overwrite::Replace) => (path, true),
+            (Some(_), Overwrite::Rename) => (unique(&path, &self.claimed), false),
+        };
+        let target = Target {
+            path,
+            replace,
+            overwrite: self.overwrite,
         };
         self.claimed.insert(target.path.clone());
         Ok(Some(target))
@@ -282,7 +312,11 @@ impl Extractor {
 
     /// Opens entry `name` for writing; `None` = skip.
     pub fn file(&mut self, name: &str, size: u64) -> Result<Option<Out>> {
-        self.target(name)?.map(|t| Out::new(&t, size)).transpose()
+        Ok(self
+            .target(name)?
+            .map(|t| Out::new(&t, size))
+            .transpose()?
+            .flatten())
     }
 
     /// Queues a filled entry for the writer threads.
@@ -432,7 +466,7 @@ fn work(rx: &Mutex<Receiver<Job>>, state: &PoolState) {
         let Ok(job) = job else { return };
         let stopped = state.cancel.load(Ordering::Relaxed) || state.error.lock().unwrap().is_some();
         if !stopped {
-            match job() {
+            match crate::no_panic(job) {
                 Ok(None) => {}
                 Ok(Some(w)) => state.warnings.lock().unwrap().push(w),
                 Err(e) => {
@@ -470,15 +504,20 @@ pub(crate) fn make_dirs(dest: &Path, dir: &Path) -> Result<()> {
 
 /// `name.ext` → `name (1).ext`, `name (2).ext`, … first one that is free.
 fn unique(path: &Path, claimed: &HashSet<PathBuf>) -> PathBuf {
+    (1..)
+        .map(|n| numbered(path, n))
+        .find(|p| !claimed.contains(p) && fs::symlink_metadata(p).is_err())
+        .expect("unbounded range")
+}
+
+/// `name.ext` → `name (n).ext`.
+fn numbered(path: &Path, n: u32) -> PathBuf {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     let ext = path
         .extension()
         .map(|e| format!(".{}", e.to_string_lossy()))
         .unwrap_or_default();
-    (1..)
-        .map(|n| path.with_file_name(format!("{stem} ({n}){ext}")))
-        .find(|p| !claimed.contains(p) && fs::symlink_metadata(p).is_err())
-        .expect("unbounded range")
+    path.with_file_name(format!("{stem} ({n}){ext}"))
 }
 
 /// Creates `link → target` if the target stays inside `dest`. Returns false if skipped.

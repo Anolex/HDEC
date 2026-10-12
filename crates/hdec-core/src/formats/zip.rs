@@ -202,7 +202,9 @@ fn decode_parallel(
                         match target {
                             None => read_entry(&mut zip, item, ctx, &mut meter, &mut io::sink())?,
                             Some(t) => {
-                                let mut out = Out::new(t, item.size)?;
+                                let Some(mut out) = Out::new(t, item.size)? else {
+                                    continue;
+                                };
                                 read_entry(&mut zip, item, ctx, &mut meter, &mut out)?;
                                 out.finish(item.modified, item.mode)?;
                             }
