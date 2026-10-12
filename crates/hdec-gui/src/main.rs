@@ -49,6 +49,13 @@ fn main() -> eframe::Result {
         .map(|p| std::path::absolute(&p).unwrap_or_else(|_| p.into()));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            // Otherwise eframe shows its own logo (Dock, taskbar, title bar).
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!(
+                    "../../../packaging/macos/icon.png"
+                ))
+                .expect("bundled icon is a valid PNG"),
+            )
             .with_inner_size(WINDOW)
             .with_min_inner_size([560.0, 340.0]),
         ..Default::default()

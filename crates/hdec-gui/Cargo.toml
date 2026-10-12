@@ -22,5 +22,9 @@ objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-app-kit.workspace = true
 
+# Matched against the build machine: the icon is embedded when building on Windows.
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true
+
 [dev-dependencies]
 egui_kittest.workspace = true

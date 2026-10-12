@@ -1,4 +1,4 @@
-"""Draws the HDEC icon and writes HDEC.icns next to this script.
+"""Draws the HDEC icon: HDEC.icns and icon.png here, ../windows/hdec.ico.
 Needs Pillow and macOS `iconutil`: python3 packaging/macos/make-icon.py"""
 import os, subprocess, tempfile
 from PIL import Image, ImageDraw, ImageFilter
@@ -31,17 +31,17 @@ def icon():
     d = ImageDraw.Draw(img)
     white = (255, 255, 255, 255)
     blue = bottom + (255,)
-    # Archive box: lid and body.
-    d.rounded_rectangle((270 * S, 330 * S, 754 * S, 430 * S), 26 * S, fill=white)
-    d.rounded_rectangle((300 * S, 450 * S, 724 * S, 760 * S), 30 * S, fill=white)
+    # Archive box: lid and body, together centred on the tile (y 297-727).
+    d.rounded_rectangle((270 * S, 297 * S, 754 * S, 397 * S), 26 * S, fill=white)
+    d.rounded_rectangle((300 * S, 417 * S, 724 * S, 727 * S), 30 * S, fill=white)
     # Zipper down the middle: teeth alternate left and right.
     cx = 512 * S
-    for i, y in enumerate(range(452, 640, 28)):
+    for i, y in enumerate(range(419, 607, 28)):
         x0 = cx - (34 if i % 2 == 0 else 0) * S
         d.rounded_rectangle((x0, y * S, x0 + 34 * S, (y + 18) * S), 5 * S, fill=blue)
     # Pull tab.
-    d.rounded_rectangle((cx - 30 * S, 640 * S, cx + 30 * S, 720 * S), 16 * S, fill=blue)
-    d.rounded_rectangle((cx - 12 * S, 660 * S, cx + 12 * S, 700 * S), 8 * S, fill=white)
+    d.rounded_rectangle((cx - 30 * S, 607 * S, cx + 30 * S, 687 * S), 16 * S, fill=blue)
+    d.rounded_rectangle((cx - 12 * S, 627 * S, cx + 12 * S, 667 * S), 8 * S, fill=white)
     return img.resize((1024, 1024), Image.LANCZOS)
 
 
@@ -56,3 +56,8 @@ with tempfile.TemporaryDirectory() as tmp:
             big.resize((px, px), Image.LANCZOS).save(os.path.join(iconset, name))
     subprocess.run(["iconutil", "-c", "icns", iconset, "-o", os.path.join(here, "HDEC.icns")], check=True)
 big.save(os.path.join(here, "icon.png"))
+# Windows icons fill their square: just the tile, without the Mac margin.
+tile = big.crop((92, 92, 932, 932))
+win = os.path.join(here, "..", "windows")
+os.makedirs(win, exist_ok=True)
+tile.save(os.path.join(win, "hdec.ico"), sizes=[(s, s) for s in (16, 24, 32, 48, 64, 128, 256)])
