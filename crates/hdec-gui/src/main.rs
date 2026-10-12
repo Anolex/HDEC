@@ -444,6 +444,12 @@ impl App {
         });
     }
 
+    fn new_menu(&mut self, ui: &mut egui::Ui) {
+        if let Some(sources) = pick_sources(ui) {
+            self.new_archive(sources);
+        }
+    }
+
     fn create(&mut self, ctx: &egui::Context, form: CreateForm) {
         let dest = PathBuf::from(&form.dest);
         let opts = CreateOptions {
@@ -532,8 +538,8 @@ impl App {
                 }
             }
             Command::AddFolder if self.modifiable => {
-                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    self.add(ctx, vec![dir]);
+                if let Some(dirs) = rfd::FileDialog::new().pick_folders() {
+                    self.add(ctx, dirs);
                 }
             }
             Command::Move(paths, into) if self.modifiable => {
@@ -637,20 +643,7 @@ impl App {
                 self.open(ui.ctx(), p);
             }
             let new = theme::tool_button(ui, icon::PLUS_SQUARE, "New", idle, false);
-            egui::Popup::menu(&new).show(|ui| {
-                if ui
-                    .button(format!("{}  From files…", icon::FILE_PLUS))
-                    .clicked()
-                {
-                    self.new_archive(rfd::FileDialog::new().pick_files().unwrap_or_default());
-                }
-                if ui
-                    .button(format!("{}  From folder…", icon::FOLDER_PLUS))
-                    .clicked()
-                {
-                    self.new_archive(rfd::FileDialog::new().pick_folder().into_iter().collect());
-                }
-            });
+            egui::Popup::menu(&new).show(|ui| self.new_menu(ui));
             theme::tool_separator(ui);
             if theme::tool_button(ui, icon::EXPORT, "Extract", has, true).clicked() {
                 self.start_extract();
@@ -676,7 +669,7 @@ impl App {
                     self.command(ui.ctx(), Command::AddFiles);
                 }
                 if ui
-                    .button(format!("{}  Folder…", icon::FOLDER_PLUS))
+                    .button(format!("{}  Folders…", icon::FOLDER_PLUS))
                     .clicked()
                 {
                     self.command(ui.ctx(), Command::AddFolder);
@@ -1139,7 +1132,7 @@ impl App {
                         action = Some(Command::AddFiles);
                     }
                     if ui
-                        .button(format!("{}  Add folder…", icon::FOLDER_PLUS))
+                        .button(format!("{}  Add folders…", icon::FOLDER_PLUS))
                         .clicked()
                     {
                         action = Some(Command::AddFolder);
@@ -1185,10 +1178,8 @@ impl App {
                     {
                         self.open(ui.ctx(), p);
                     }
-                    if theme::button(ui, &format!("{}  New archive…", icon::PLUS_SQUARE)).clicked()
-                    {
-                        self.new_archive(rfd::FileDialog::new().pick_files().unwrap_or_default());
-                    }
+                    let new = theme::button(ui, &format!("{}  New archive…", icon::PLUS_SQUARE));
+                    egui::Popup::menu(&new).show(|ui| self.new_menu(ui));
                 });
                 ui.add_space(14.0);
                 ui.label(
@@ -1283,7 +1274,9 @@ impl App {
             egui::Stroke::new(2.0, p.accent),
             egui::StrokeKind::Inside,
         );
-        let text = if self.modifiable {
+        let text = if matches!(self.dialog, Dialog::Create(_)) {
+            "Add to the new archive".to_owned()
+        } else if self.modifiable {
             format!("Add to “/{}”", self.cwd)
         } else {
             "Drop to open or create an archive".to_owned()
@@ -1641,6 +1634,13 @@ impl eframe::App for App {
         });
         if !dropped.is_empty() && self.job.is_none() {
             match dropped.as_slice() {
+                _ if let Dialog::Create(form) = &mut self.dialog => {
+                    for src in dropped {
+                        if !form.sources.contains(&src) {
+                            form.sources.push(src);
+                        }
+                    }
+                }
                 // An editable archive is open: everything dropped goes into it.
                 _ if self.modifiable => self.add(&ctx, dropped),
                 [one] if one.is_file() && hdec_core::detect(one).is_ok() => {
@@ -1736,6 +1736,20 @@ fn password_field(ui: &mut egui::Ui, value: &mut String, show: &mut bool, focus:
     .inner
 }
 
+/// "Files…" / "Folders…" menu entries. Folders go in with everything inside them.
+fn pick_sources(ui: &mut egui::Ui) -> Option<Vec<PathBuf>> {
+    if ui.button(format!("{}  Files…", icon::FILE_PLUS)).clicked() {
+        return rfd::FileDialog::new().pick_files();
+    }
+    if ui
+        .button(format!("{}  Folders…", icon::FOLDER_PLUS))
+        .clicked()
+    {
+        return rfd::FileDialog::new().pick_folders();
+    }
+    None
+}
+
 fn path_field(ui: &mut egui::Ui, value: &mut String, browse: impl FnOnce() -> Option<PathBuf>) {
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(value).desired_width(ui.available_width() - 82.0));
@@ -1755,6 +1769,10 @@ fn create_form(ui: &mut egui::Ui, form: &mut CreateForm) -> Option<bool> {
         .num_columns(2)
         .spacing(vec2(12.0, 10.0))
         .show(ui, |ui| {
+            theme::form_label(ui, "Contents");
+            sources_list(ui, &mut form.sources);
+            ui.end_row();
+
             theme::form_label(ui, "Save as");
             let dest = form.dest.clone();
             path_field(ui, &mut form.dest, || {
@@ -1847,6 +1865,9 @@ fn create_form(ui: &mut egui::Ui, form: &mut CreateForm) -> Option<bool> {
             });
             ui.end_row();
         });
+    if !fits(form.format, &form.sources) {
+        form.format = Format::Zip;
+    }
     if let Some(stem) = form.dest.strip_suffix(&format!(".{old_ext}")) {
         form.dest = format!("{stem}.{}", form.format.extension());
     }
@@ -1864,7 +1885,7 @@ fn create_form(ui: &mut egui::Ui, form: &mut CreateForm) -> Option<bool> {
         if theme::primary_button(
             ui,
             "Create",
-            !mismatch && !bad_split && !form.dest.is_empty(),
+            !mismatch && !bad_split && !form.dest.is_empty() && !form.sources.is_empty(),
         )
         .clicked()
         {
@@ -1875,6 +1896,62 @@ fn create_form(ui: &mut egui::Ui, form: &mut CreateForm) -> Option<bool> {
         }
     });
     result
+}
+
+/// What goes into a new archive: removable rows, plus a button to add more.
+fn sources_list(ui: &mut egui::Ui, sources: &mut Vec<PathBuf>) {
+    let p = pal(ui.ctx());
+    let width = ui.available_width();
+    ui.vertical(|ui| {
+        ui.set_width(width);
+        let mut remove = None;
+        egui::ScrollArea::vertical()
+            .max_height(104.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (i, src) in sources.iter().enumerate() {
+                    let name = src
+                        .file_name()
+                        .map_or_else(|| src.display().to_string(), |n| n.to_string_lossy().into());
+                    ui.horizontal(|ui| {
+                        let (glyph, color) = if src.is_dir() {
+                            (icon::FOLDER, p.accent)
+                        } else {
+                            (theme::file_icon(&name), p.muted)
+                        };
+                        ui.label(RichText::new(glyph).color(color));
+                        ui.add(egui::Label::new(&name).truncate())
+                            .on_hover_text(src.display().to_string());
+                        if src.is_dir() {
+                            ui.label(
+                                RichText::new("and everything inside")
+                                    .size(11.5)
+                                    .color(p.faint),
+                            );
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::icon_button(ui, icon::X, true)
+                                .on_hover_text("Remove")
+                                .clicked()
+                            {
+                                remove = Some(i);
+                            }
+                        });
+                    });
+                }
+            });
+        if let Some(i) = remove {
+            sources.remove(i);
+        }
+        let add = ui.add(egui::Button::new(format!("{}  Add…", icon::PLUS)).small());
+        egui::Popup::menu(&add).show(|ui| {
+            for src in pick_sources(ui).unwrap_or_default() {
+                if !sources.contains(&src) {
+                    sources.push(src);
+                }
+            }
+        });
+    });
 }
 
 /// Accepts a dropped `Dragged` payload on `response`, highlighting it while hovered.
@@ -2333,7 +2410,10 @@ mod tests {
                 app.start_extract();
             }),
             ("create", |app, _, path, _| {
-                app.new_archive(vec![path.to_path_buf(), path.with_file_name("rar4.rar")]);
+                app.new_archive(vec![
+                    path.parent().unwrap().to_path_buf(),
+                    path.to_path_buf(),
+                ]);
                 if let Dialog::Create(form) = &mut app.dialog {
                     form.format = Format::SevenZ;
                     *form.password = "secret".into();

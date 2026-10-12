@@ -1067,3 +1067,36 @@ fn modifies_info_zip_archives() {
         b"hello"
     );
 }
+
+#[test]
+fn modify_adds_folder_trees() {
+    for format in [Format::Zip, Format::SevenZ, Format::Tar, Format::TarXz] {
+        let (tmp, _, archive) = create(format, Level::Normal, false, None);
+        let extra = tmp.path().join("extra");
+        fs::create_dir_all(extra.join("one/two/empty")).unwrap();
+        fs::write(extra.join("top.txt"), "top").unwrap();
+        fs::write(extra.join("one/two/deep.txt"), "deep").unwrap();
+        let cancel = AtomicBool::new(false);
+        let c = ctx(None, &cancel);
+        hdec_core::modify(
+            &archive,
+            &hdec_core::Edit::Add {
+                sources: vec![extra.clone()],
+                into: "tree/sub".into(),
+            },
+            &c,
+        )
+        .unwrap();
+        let out = tmp.path().join("x");
+        let warnings = extract(&archive, &out, None).unwrap();
+        assert!(
+            warnings.iter().all(|w| w.contains("link")),
+            "{format:?}: {warnings:?}"
+        );
+        let got = out.join("tree/sub/extra");
+        assert_eq!(fs::read(got.join("top.txt")).unwrap(), b"top", "{format:?}");
+        assert_eq!(fs::read(got.join("one/two/deep.txt")).unwrap(), b"deep");
+        assert!(got.join("one/two/empty").is_dir(), "{format:?}");
+        assert!(out.join("tree/sub/deeper/big.bin").is_file(), "{format:?}");
+    }
+}
