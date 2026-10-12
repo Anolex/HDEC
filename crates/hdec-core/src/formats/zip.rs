@@ -602,6 +602,20 @@ pub fn modify(path: &Path, edit: &Edit, ctx: &Ctx) -> Result<()> {
     finish(w)
 }
 
+/// Any ZipCrypto (not AES) entry? `raw_copy_file` drops their encryption flag
+/// (zip 9.0.1), so `modify` can't copy them.
+pub fn has_zip_crypto(path: &Path) -> Result<bool> {
+    use zip::read::HasZipMetadata;
+    let mut zip = open(path)?;
+    for i in 0..zip.len() {
+        let f = zip.by_index_raw(i)?;
+        if f.encrypted() && f.get_metadata().aes_settings().is_none() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// `renamed("a/b/c", "a/b", "x")` → `Some("x/c")`.
 fn renamed(name: &str, from: &str, to: &str) -> Option<String> {
     let rest = name.strip_prefix(from)?;

@@ -1597,3 +1597,108 @@ fn editing_a_tar_keeps_the_last_of_duplicate_entries() {
     extract(&archive, &out, None).unwrap();
     assert_eq!(fs::read(out.join("x.txt")).unwrap(), b"new");
 }
+
+#[test]
+fn editing_keeps_names_that_differ_only_in_case() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("case.tar");
+    let mut b = tar::Builder::new(fs::File::create(&archive).unwrap());
+    for (name, data) in [("Makefile", &b"upper"[..]), ("makefile", b"lower")] {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        b.append_data(&mut h, name, data).unwrap();
+    }
+    b.into_inner().unwrap();
+    let cancel = AtomicBool::new(false);
+    let c = ctx(None, &cancel);
+    // On case-insensitive file systems one would overwrite the other while
+    // rebuilding; refusing is fine, losing one is not.
+    let _ = hdec_core::modify(&archive, &hdec_core::Edit::CreateDir("d".into()), &c);
+    let names: Vec<_> = hdec_core::list(&archive, &c)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.path)
+        .filter(|p| p.ends_with("akefile"))
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_files_can_be_added() {
+    use std::os::unix::fs::PermissionsExt;
+    let (tmp, _, archive) = create(Format::SevenZ, Level::Fast, false, None);
+    let file = tmp.path().join("locked.txt");
+    fs::write(&file, "ro").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+    let cancel = AtomicBool::new(false);
+    let add = hdec_core::Edit::Add {
+        sources: vec![file],
+        into: String::new(),
+    };
+    hdec_core::modify(&archive, &add, &ctx(None, &cancel)).unwrap();
+    let out = tmp.path().join("out");
+    extract(&archive, &out, None).unwrap();
+    assert_eq!(fs::read(out.join("locked.txt")).unwrap(), b"ro");
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_colliding_with_a_folder_is_skipped_not_fatal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("c.tar");
+    let mut b = tar::Builder::new(fs::File::create(&archive).unwrap());
+    let mut h = tar::Header::new_gnu();
+    h.set_entry_type(tar::EntryType::Directory);
+    h.set_size(0);
+    h.set_mode(0o755);
+    b.append_data(&mut h, "d/Sub/", &[][..]).unwrap();
+    let mut h = tar::Header::new_gnu();
+    h.set_entry_type(tar::EntryType::Symlink);
+    h.set_size(0);
+    b.append_link(&mut h, "d/sub", "x").unwrap();
+    b.into_inner().unwrap();
+    let r = extract(&archive, &tmp.path().join("out"), None);
+    assert!(r.is_ok(), "{r:?}");
+    assert!(tmp.path().join("out/d/Sub").is_dir());
+}
+
+#[test]
+fn zip_modify_keeps_zipcrypto_entries() {
+    let (tmp, src, archive) = create(Format::Zip, Level::Normal, true, Some("pw"));
+    let cancel = AtomicBool::new(false);
+    let c = ctx(Some("pw"), &cancel);
+    hdec_core::modify(
+        &archive,
+        &hdec_core::Edit::Rename(vec![("tree/a.txt".into(), "tree/b.txt".into())]),
+        &c,
+    )
+    .unwrap();
+    hdec_core::test(&archive, &c).unwrap();
+    let out = tmp.path().join("x");
+    extract(&archive, &out, Some("pw")).unwrap();
+    assert_eq!(fs::read(out.join("tree/b.txt")).unwrap(), b"hello");
+    assert_eq!(
+        fs::read(out.join("tree/sub/deeper/big.bin")).unwrap(),
+        fs::read(src.join("sub/deeper/big.bin")).unwrap()
+    );
+}
+
+#[test]
+fn renaming_onto_a_name_differing_in_case_is_refused() {
+    let (_tmp, _, archive) = create(Format::Zip, Level::Fast, false, None);
+    let cancel = AtomicBool::new(false);
+    let c = ctx(None, &cancel);
+    let rename = |to: &str| {
+        hdec_core::modify(
+            &archive,
+            &hdec_core::Edit::Rename(vec![("tree/zero.bin".into(), to.into())]),
+            &c,
+        )
+    };
+    let r = rename("tree/A.TXT");
+    assert!(matches!(r, Err(Error::Unsupported(_))), "{r:?}");
+    // Changing only its own case is fine.
+    rename("tree/ZERO.bin").unwrap();
+}

@@ -322,14 +322,17 @@ pub fn modify(path: &Path, edit: &Edit, ctx: &Ctx) -> Result<()> {
             path.display()
         )));
     }
-    check_edit(edit, &names_with_parents(&list(path, ctx)?))?;
+    let names = names_with_parents(&list(path, ctx)?);
+    check_edit(edit, &names)?;
     match detect(path)? {
-        Format::Zip => formats::zip::modify(path, edit, ctx),
+        Format::Zip if !formats::zip::has_zip_crypto(path)? => {
+            formats::zip::modify(path, edit, ctx)
+        }
         Format::Rar => {
             formats::rar::check_editable(path, ctx)?;
-            rewrite(path, Format::Rar, edit, ctx)
+            rewrite(path, Format::Rar, &names, edit, ctx)
         }
-        format => rewrite(path, format, edit, ctx),
+        format => rewrite(path, format, &names, edit, ctx),
     }
 }
 
@@ -351,6 +354,13 @@ fn names_with_parents(entries: &[Entry]) -> std::collections::BTreeSet<String> {
 fn check_edit(edit: &Edit, existing: &std::collections::BTreeSet<String>) -> Result<()> {
     let refuse = |msg: String| Err(Error::Unsupported(msg));
     let valid = |name: &str| safe_path::join(Path::new("/"), name).is_ok() && !name.ends_with('/');
+    // Case-insensitive, as on macOS and Windows disks; `except` may match.
+    let taken = |name: &str, except: &str| {
+        let name = name.to_lowercase();
+        existing
+            .iter()
+            .any(|e| e != except && e.to_lowercase() == name)
+    };
     match edit {
         Edit::Rename(pairs) => {
             for (from, to) in pairs {
@@ -363,7 +373,7 @@ fn check_edit(edit: &Edit, existing: &std::collections::BTreeSet<String>) -> Res
                 if to.starts_with(&format!("{from}/")) {
                     return refuse(format!("can't move “{from}” into itself"));
                 }
-                if to != from && existing.contains(to) {
+                if taken(to, from) {
                     return refuse(format!("“{to}” already exists"));
                 }
             }
@@ -372,7 +382,7 @@ fn check_edit(edit: &Edit, existing: &std::collections::BTreeSet<String>) -> Res
         Edit::CreateDir(dir) if !valid(dir) => {
             return refuse(format!("“{dir}” is not a valid name"));
         }
-        Edit::CreateDir(dir) if existing.contains(dir) => {
+        Edit::CreateDir(dir) if taken(dir, "") => {
             return refuse(format!("“{dir}” already exists"));
         }
         _ => {}
@@ -381,9 +391,23 @@ fn check_edit(edit: &Edit, existing: &std::collections::BTreeSet<String>) -> Res
 }
 
 /// Generic modify: extract next to the archive, edit the files, re-create, test
-/// the new archive, and only then replace the old one.
-/// ponytail: recompresses everything at Normal level; ZIP has a raw-copy path instead.
-fn rewrite(path: &Path, format: Format, edit: &Edit, ctx: &Ctx) -> Result<()> {
+/// the new archive, and only then replace the old one. `names`: what's in it.
+/// ponytail: recompresses everything at Normal level; ZIP has a raw-copy path
+/// instead, except with ZipCrypto entries (the zip crate can't copy those).
+fn rewrite(
+    path: &Path,
+    format: Format,
+    names: &std::collections::BTreeSet<String>,
+    edit: &Edit,
+    ctx: &Ctx,
+) -> Result<()> {
+    // Extracted to a case-insensitive disk, one would overwrite the other.
+    let mut folded = std::collections::HashSet::new();
+    if let Some(name) = names.iter().find(|n| !folded.insert(n.to_lowercase())) {
+        return Err(Error::Unsupported(format!(
+            "“{name}” and another entry differ only in upper/lower case, which this disk can't hold apart"
+        )));
+    }
     let scratch = tempfile::Builder::new()
         .prefix(".hdec-edit")
         .tempdir_in(path.parent().unwrap_or(Path::new(".")))?;
@@ -440,6 +464,7 @@ fn rewrite(path: &Path, format: Format, edit: &Edit, ctx: &Ctx) -> Result<()> {
     sources.sort();
     let opts = CreateOptions {
         format,
+        zip_crypto: format == Format::Zip, // ZIP only gets here with ZipCrypto entries
         ..Default::default()
     };
     // Same file name, so detection by extension (tar.gz vs gz) still works.

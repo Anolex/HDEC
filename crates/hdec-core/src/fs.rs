@@ -338,7 +338,7 @@ impl Extractor {
         };
         let (dest, name, target) = (self.dest.clone(), name.to_owned(), target.to_owned());
         self.pool.submit(Box::new(move || {
-            Ok((!symlink(&dest, &t.path, &target)?)
+            Ok((!symlink(&dest, &t.path, &target, t.replace)?)
                 .then(|| format!("skipped symlink {name} -> {target}")))
         }))
     }
@@ -531,20 +531,25 @@ fn numbered(path: &Path, n: u32) -> PathBuf {
     path.with_file_name(format!("{stem} ({n}){ext}"))
 }
 
-/// Creates `link → target` if the target stays inside `dest`. Returns false if skipped.
-/// Windows: always skipped (creating symlinks needs special privileges there).
-pub(crate) fn symlink(dest: &Path, link: &Path, target: &str) -> Result<bool> {
+/// Creates `link → target` if the target stays inside `dest`. Returns false if
+/// skipped, also when the name turns up taken (case-insensitive file systems).
+/// `replace`: remove what is there first. Windows: always skipped (creating
+/// symlinks needs special privileges there).
+pub(crate) fn symlink(dest: &Path, link: &Path, target: &str, replace: bool) -> Result<bool> {
     let rel = link
         .strip_prefix(dest)
         .map_err(|_| Error::UnsafePath(link.display().to_string()))?;
     if !cfg!(unix) || !safe_path::link_stays_inside(rel, target) {
         return Ok(false);
     }
-    if fs::symlink_metadata(link).is_ok() {
+    if replace && fs::symlink_metadata(link).is_ok() {
         fs::remove_file(link)?;
     }
     #[cfg(unix)]
-    std::os::unix::fs::symlink(target, link)?;
+    match std::os::unix::fs::symlink(target, link) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        r => r?,
+    }
     Ok(true)
 }
 
@@ -637,11 +642,11 @@ pub(crate) fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         #[cfg(unix)]
         std::os::unix::fs::symlink(fs::read_link(src)?, dst)?;
     } else if meta.is_file() {
-        fs::copy(src, dst)?;
-        File::options()
-            .write(true)
-            .open(dst)?
-            .set_modified(meta.modified()?)?;
+        // Not `fs::copy`: it copies a read-only mode, and the time can't be set after.
+        let mut out = File::create(dst)?;
+        io::copy(&mut File::open(src)?, &mut out)?;
+        out.set_modified(meta.modified()?)?;
+        set_mode(&out, mode(&meta))?;
     }
     Ok(())
 }
