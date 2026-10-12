@@ -1,6 +1,8 @@
 // No console window behind the GUI on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(target_os = "macos")]
+mod mac_open;
 #[cfg_attr(target_os = "macos", allow(dead_code))] // macOS uses the native panel
 mod picker;
 mod theme;
@@ -51,11 +53,15 @@ fn main() -> eframe::Result {
             .with_min_inner_size([560.0, 340.0]),
         ..Default::default()
     };
+    #[cfg(target_os = "macos")]
+    mac_open::install();
     eframe::run_native(
         "HDEC",
         options,
         Box::new(move |cc| {
             theme::install(&cc.egui_ctx);
+            #[cfg(target_os = "macos")]
+            mac_open::set_context(&cc.egui_ctx);
             if let Some(path) = path {
                 app.open(&cc.egui_ctx, path);
             }
@@ -1904,6 +1910,16 @@ impl eframe::App for App {
                 }
                 _ => self.new_archive(dropped),
             }
+        }
+        // Opened from Finder; waits while something else is going on. One
+        // window, so of several files the last one wins.
+        #[cfg(target_os = "macos")]
+        if self.job.is_none()
+            && matches!(self.dialog, Dialog::None)
+            && self.picker.is_none()
+            && let Some(path) = mac_open::take().pop()
+        {
+            self.open(&ctx, path);
         }
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty() && !self.closing {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);

@@ -29,6 +29,10 @@ zeroize = "1.9.1"
 # dev-only: headless screenshots of the GUI
 egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu", "snapshot"] }
 egui-phosphor = { version = "0.14.0", features = ["regular", "fill"] }
+# macOS only: receive files opened from Finder (same versions rfd uses).
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSNotification", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder"] }
 
 # Compression crates are unusably slow unoptimized; keep our own code debuggable.
 [profile.dev.package."*"]

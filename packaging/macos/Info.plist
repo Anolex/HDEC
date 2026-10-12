@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>HDEC</string>
+	<key>CFBundleDisplayName</key>
+	<string>HDEC</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.anolex.hdec</string>
+	<key>CFBundleExecutable</key>
+	<string>hdec</string>
+	<key>CFBundleIconFile</key>
+	<string>HDEC</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+
+	<!-- Archives HDEC opens. Owner = Alternate: offered in "Open With" and
+	     can be made the default, without claiming to be the format's owner. -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Archive</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.zip-archive</string>
+				<string>org.7-zip.7-zip-archive</string>
+				<string>com.rarlab.rar-archive</string>
+				<string>public.tar-archive</string>
+				<string>org.gnu.gnu-zip-archive</string>
+				<string>org.gnu.gnu-zip-tar-archive</string>
+				<string>org.tukaani.xz-archive</string>
+				<string>org.tukaani.tar-xz-archive</string>
+				<string>public.bzip2-archive</string>
+				<string>public.tar-bzip2-archive</string>
+				<string>org.tukaani.lzma-archive</string>
+				<string>io.github.anolex.hdec.zst</string>
+				<string>io.github.anolex.hdec.tar-zst</string>
+				<string>io.github.anolex.hdec.lz</string>
+				<string>io.github.anolex.hdec.tar-lz</string>
+				<string>io.github.anolex.hdec.split</string>
+				<!-- Declared instead by Bandizip when it is installed. -->
+				<string>com.bandisoft.zst</string>
+				<string>com.bandisoft.lz</string>
+				<string>com.bandisoft.001</string>
+			</array>
+		</dict>
+	</array>
+
+	<!-- Types macOS doesn't know by itself; used only if nothing else declares them. -->
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>io.github.anolex.hdec.zst</string>
+			<key>UTTypeDescription</key>
+			<string>Zstandard archive</string>
+			<key>UTTypeConformsTo</key>
+			<array><string>public.data</string><string>public.archive</string></array>
+			<key>UTTypeTagSpecification</key>
+			<dict><key>public.filename-extension</key><array><string>zst</string></array></dict>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>io.github.anolex.hdec.tar-zst</string>
+			<key>UTTypeDescription</key>
+			<string>Zstandard tar archive</string>
+			<key>UTTypeConformsTo</key>
+			<array><string>public.data</string><string>public.archive</string></array>
+			<key>UTTypeTagSpecification</key>
+			<dict><key>public.filename-extension</key><array><string>tzst</string></array></dict>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>io.github.anolex.hdec.lz</string>
+			<key>UTTypeDescription</key>
+			<string>Lzip archive</string>
+			<key>UTTypeConformsTo</key>
+			<array><string>public.data</string><string>public.archive</string></array>
+			<key>UTTypeTagSpecification</key>
+			<dict><key>public.filename-extension</key><array><string>lz</string></array></dict>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>io.github.anolex.hdec.tar-lz</string>
+			<key>UTTypeDescription</key>
+			<string>Lzip tar archive</string>
+			<key>UTTypeConformsTo</key>
+			<array><string>public.data</string><string>public.archive</string></array>
+			<key>UTTypeTagSpecification</key>
+			<dict><key>public.filename-extension</key><array><string>tlz</string></array></dict>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>io.github.anolex.hdec.split</string>
+			<key>UTTypeDescription</key>
+			<string>Split archive part</string>
+			<key>UTTypeConformsTo</key>
+			<array><string>public.data</string></array>
+			<key>UTTypeTagSpecification</key>
+			<dict><key>public.filename-extension</key><array><string>001</string></array></dict>
+		</dict>
+	</array>
+</dict>
+</plist>
