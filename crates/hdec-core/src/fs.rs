@@ -97,10 +97,17 @@ impl Seek for OutFile {
 /// bigger ones are written by the decoder and only finished by the pool.
 const BUFFERED: u64 = 1 << 20;
 
-/// Writer threads. File creation, not bandwidth, is the bottleneck: on APFS
-/// 4–8 threads write small files ~2x faster than one, more gets slower.
+/// Writer threads. File creation, not bandwidth, is the bottleneck. On APFS
+/// 4 is best wherever we measured (8 is up to 2x slower in watched folders).
+/// Windows: Defender scans each file on close, which more threads hide.
+/// ponytail: Windows count unmeasured; run the bench example on Windows 10.
 pub(crate) fn writer_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 8))
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    if cfg!(windows) {
+        cores.clamp(4, 16)
+    } else {
+        cores.min(4)
+    }
 }
 
 /// One extracted file being filled. `finish` sets its time and mode and

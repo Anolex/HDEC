@@ -15,6 +15,7 @@ cargo run -p hdec-gui -- [archive]
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo test -p hdec-gui -- --ignored screenshots   # renders every UI state (dark + light) to target/ui-shots/*.png
+cargo run --release -p hdec-core --example bench -- <folder> [level] [zip 7z ...]   # create/test/extract timings per format
 for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do cargo tree -i cc --target $t -e normal,build; done   # each must print "nothing to print"
 ```
 
