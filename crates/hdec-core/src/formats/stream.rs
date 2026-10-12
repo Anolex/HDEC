@@ -89,6 +89,11 @@ fn bzip2_streams(r: &mut (impl Read + Seek)) -> io::Result<Option<Vec<(u64, u64)
         if end {
             break;
         }
+        // Past the cap with no new stream: one big stream, decoded in order anyway.
+        if base + scan as u64 > starts.last().copied().unwrap_or(0) + BZ_STREAM_MAX {
+            r.seek(SeekFrom::Start(0))?;
+            return Ok(None);
+        }
         data.drain(..scan);
         base += scan as u64;
     }
@@ -666,7 +671,7 @@ pub fn extract(
                 meter.copy(&name, r, &mut out)?;
                 out.finish(None, None)?;
             }
-            Ok(Vec::new())
+            x.finish()
         }
     })
 }

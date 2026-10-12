@@ -2420,7 +2420,6 @@ fn sort_rows(rows: &mut [Entry], key: SortKey, descending: bool) {
     });
 }
 
-/// `photos.tar.gz` → `photos`
 /// `photos.tar.gz` → `photos`, `Report 1.5.zip` → `Report 1.5`,
 /// `set.part2.rar` / `set.7z.003` → `set`.
 fn archive_stem(path: &Path) -> String {

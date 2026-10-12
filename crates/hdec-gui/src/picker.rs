@@ -22,6 +22,8 @@ pub struct Picker {
     selected: BTreeSet<usize>,
     anchor: Option<usize>,
     error: Option<String>,
+    /// Probed once: checking drive letters can stall on disconnected drives.
+    places: Vec<(String, PathBuf)>,
 }
 
 pub enum Picked {
@@ -38,6 +40,7 @@ impl Picker {
             selected: BTreeSet::new(),
             anchor: None,
             error: None,
+            places: places_list(),
         };
         picker.navigate(start);
         picker
@@ -87,9 +90,9 @@ impl Picker {
                 }
                 let places = theme::icon_button(ui, icon::HOUSE, true).on_hover_text("Places");
                 egui::Popup::menu(&places).show(|ui| {
-                    for (name, path) in places_list() {
+                    for (name, path) in &self.places {
                         if ui.button(name).clicked() {
-                            go = Some(path);
+                            go = Some(path.clone());
                         }
                     }
                 });

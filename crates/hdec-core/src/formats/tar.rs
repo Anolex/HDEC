@@ -103,6 +103,8 @@ pub fn extract(
                 r => r?,
             }
         }
+        // Read past the end-of-archive blocks so the stream's checksum is checked.
+        io::copy(archive.into_inner(), &mut io::sink())?;
         x.map_or(Ok(Vec::new()), Extractor::finish)
     })
 }

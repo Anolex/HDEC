@@ -1702,3 +1702,26 @@ fn renaming_onto_a_name_differing_in_case_is_refused() {
     // Changing only its own case is fine.
     rename("tree/ZERO.bin").unwrap();
 }
+
+#[test]
+fn single_file_streams_report_skips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("notes.txt");
+    fs::write(&file, "hi").unwrap();
+    let archive = tmp.path().join("notes.txt.gz");
+    let cancel = AtomicBool::new(false);
+    let c = ctx(None, &cancel);
+    let opts = CreateOptions {
+        format: Format::Gz,
+        ..Default::default()
+    };
+    hdec_core::create(std::slice::from_ref(&file), &archive, &opts, &c).unwrap();
+    let out = tmp.path().join("out");
+    fs::create_dir_all(out.join("notes.txt")).unwrap();
+    let opts = ExtractOptions {
+        only: None,
+        overwrite: Overwrite::Replace,
+    };
+    let warnings = hdec_core::extract(&archive, &out, &opts, &c).unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+}
