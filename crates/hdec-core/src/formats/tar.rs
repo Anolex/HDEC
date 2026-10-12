@@ -53,6 +53,15 @@ pub fn list(path: &Path, format: Format) -> Result<Vec<Entry>> {
             modified: mtime(entry.header()),
             is_dir: kind == EntryType::Directory,
             encrypted: false,
+            link: match kind {
+                EntryType::Symlink => Some(
+                    entry
+                        .link_name()?
+                        .map(|l| l.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                ),
+                _ => None,
+            },
         });
     }
     Ok(out)

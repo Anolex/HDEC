@@ -103,6 +103,9 @@ pub fn list(path: &Path, ctx: &Ctx) -> Result<Vec<Entry>> {
                 .then(|| f.last_modified_date.into()),
             is_dir: f.is_directory,
             encrypted: encrypted(archive, i),
+            link: unix_mode(f)
+                .filter(|m| m & S_IFMT == S_IFLNK)
+                .map(|_| String::new()),
         })
         .collect())
 }

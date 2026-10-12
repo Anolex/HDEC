@@ -1701,6 +1701,7 @@ dependencies = [
  "hdec-core",
  "jiff",
  "rfd",
+ "tempfile",
  "zeroize",
 ]
 

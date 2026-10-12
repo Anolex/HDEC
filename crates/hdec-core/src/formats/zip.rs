@@ -36,24 +36,35 @@ fn open(path: &Path) -> Result<Archive> {
 }
 
 pub fn list(path: &Path, _ctx: &Ctx) -> Result<Vec<Entry>> {
-    let zip = open(path)?;
-    (0..zip.len())
-        .map(|i| {
-            let f = zip.by_index_data(i)?;
-            Ok(Entry {
-                path: f
-                    .name()?
-                    .replace('\\', "/")
-                    .trim_end_matches('/')
-                    .to_owned(),
-                size: f.size(),
-                packed: Some(f.compressed_size()),
-                modified: f.last_modified().and_then(from_dos),
-                is_dir: f.is_dir(),
-                encrypted: f.encrypted(),
-            })
-        })
-        .collect()
+    let mut zip = open(path)?;
+    let mut out = Vec::with_capacity(zip.len());
+    for i in 0..zip.len() {
+        let f = zip.by_index_data(i)?;
+        let mut entry = Entry {
+            path: f
+                .name()?
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_owned(),
+            size: f.size(),
+            packed: Some(f.compressed_size()),
+            modified: f.last_modified().and_then(from_dos),
+            is_dir: f.is_dir(),
+            encrypted: f.encrypted(),
+            link: None,
+        };
+        if f.is_symlink() {
+            // The target is the entry's (tiny) data; encrypted ones stay unknown.
+            let (encrypted, small) = (f.encrypted(), f.size() <= 4096);
+            let mut target = String::new();
+            if !encrypted && small {
+                io::Read::read_to_string(&mut io::Read::take(zip.by_index(i)?, 4096), &mut target)?;
+            }
+            entry.link = Some(target);
+        }
+        out.push(entry);
+    }
+    Ok(out)
 }
 
 struct Item {
@@ -264,7 +275,7 @@ pub fn modify(path: &Path, edit: &Edit, ctx: &Ctx) -> Result<()> {
         let new_name = match edit {
             Edit::Delete(names) if crate::is_selected(bare, Some(names)) => continue,
             Edit::Add { .. } if replaced.contains(bare) => continue,
-            Edit::Rename { from, to } => renamed(&name, from, to),
+            Edit::Rename(pairs) => pairs.iter().find_map(|(from, to)| renamed(&name, from, to)),
             _ => None,
         };
         let f = src.by_index_raw(i)?;
@@ -274,6 +285,9 @@ pub fn modify(path: &Path, edit: &Edit, ctx: &Ctx) -> Result<()> {
         }
     }
     add_items(&mut w, &added, &prefix, &CreateOptions::default(), ctx)?;
+    if let Edit::CreateDir(dir) = edit {
+        w.add_directory(dir.as_str(), SimpleFileOptions::default())?;
+    }
     drop(src); // Windows can't replace a file that is still open
     finish(w)
 }

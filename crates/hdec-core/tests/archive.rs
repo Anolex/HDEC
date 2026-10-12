@@ -698,10 +698,7 @@ fn modify_add_delete_rename() {
 
         hdec_core::modify(
             &archive,
-            &hdec_core::Edit::Rename {
-                from: "tree/sub".into(),
-                to: "tree/moved".into(),
-            },
+            &hdec_core::Edit::Rename(vec![("tree/sub".into(), "tree/moved".into())]),
             &c,
         )
         .unwrap();
@@ -972,4 +969,101 @@ fn reads_lzip() {
     );
     extract(&tmp.path().join("t.tar.lz"), &tmp.path().join("b"), None).unwrap();
     assert_eq!(fs::read(tmp.path().join("b/tree/a.txt")).unwrap(), b"hello");
+}
+
+#[test]
+fn lists_symlinks() {
+    let cancel = AtomicBool::new(false);
+    for format in [Format::Zip, Format::Tar, Format::SevenZ] {
+        let (_tmp, _, archive) = create(format, Level::Normal, false, None);
+        let entries = hdec_core::list(&archive, &ctx(None, &cancel)).unwrap();
+        let link = entries.iter().find(|e| e.path == "tree/link");
+        let file = entries.iter().find(|e| e.path == "tree/a.txt").unwrap();
+        assert_eq!(file.link, None, "{format:?}");
+        if cfg!(unix) {
+            // 7z keeps the target in solid compressed data, so only the flag is known.
+            let want = if format == Format::SevenZ {
+                ""
+            } else {
+                "a.txt"
+            };
+            assert_eq!(link.unwrap().link.as_deref(), Some(want), "{format:?}");
+        }
+    }
+    let entries = hdec_core::list(&fixture("rar5.rar"), &ctx(None, &cancel)).unwrap();
+    let link = entries.iter().find(|e| e.path == "tree/link").unwrap();
+    assert_eq!(link.link.as_deref(), Some("a.txt"));
+}
+
+#[test]
+fn modify_new_folders_and_moves() {
+    use hdec_core::Edit;
+    for format in [Format::Zip, Format::SevenZ, Format::TarGz] {
+        let (tmp, _, archive) = create(format, Level::Normal, false, None);
+        let cancel = AtomicBool::new(false);
+        let c = ctx(None, &cancel);
+        let names = || -> Vec<String> {
+            hdec_core::list(&archive, &c)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.path)
+                .collect()
+        };
+
+        hdec_core::modify(&archive, &Edit::CreateDir("tree/new dir".into()), &c).unwrap();
+        assert!(names().contains(&"tree/new dir".to_string()), "{format:?}");
+
+        let moves = vec![
+            ("tree/a.txt".into(), "tree/new dir/a.txt".into()),
+            ("tree/sub".into(), "tree/new dir/sub".into()),
+        ];
+        hdec_core::modify(&archive, &Edit::Rename(moves), &c).unwrap();
+        let out = tmp.path().join("x");
+        extract(&archive, &out, None).unwrap();
+        assert_eq!(
+            fs::read(out.join("tree/new dir/a.txt")).unwrap(),
+            b"hello",
+            "{format:?}"
+        );
+        assert_eq!(
+            fs::read(out.join("tree/new dir/sub/ünïcødé ñame.txt")).unwrap(),
+            b"unicode",
+            "{format:?}"
+        );
+        assert!(
+            !out.join("tree/a.txt").exists() && !out.join("tree/sub").exists(),
+            "{format:?}"
+        );
+
+        let refused = [
+            Edit::CreateDir("tree/new dir".into()),
+            Edit::CreateDir("../escape".into()),
+            Edit::Rename(vec![("tree/zero.bin".into(), "tree/empty".into())]),
+            Edit::Rename(vec![("tree/new dir".into(), "tree/new dir/inner".into())]),
+            Edit::Rename(vec![("tree/missing".into(), "tree/x".into())]),
+        ];
+        for edit in refused {
+            let r = hdec_core::modify(&archive, &edit, &c);
+            assert!(
+                matches!(r, Err(Error::Unsupported(_))),
+                "{format:?} {edit:?}: {r:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn modifies_info_zip_archives() {
+    // Info-ZIP writes Unix extra fields (0x7875) that must survive raw copying.
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("t.zip");
+    fs::copy(fixture("infozip.zip"), &archive).unwrap();
+    let cancel = AtomicBool::new(false);
+    let edit = hdec_core::Edit::Rename(vec![("tree/a.txt".into(), "tree/sub/a.txt".into())]);
+    hdec_core::modify(&archive, &edit, &ctx(None, &cancel)).unwrap();
+    extract(&archive, &tmp.path().join("x"), None).unwrap();
+    assert_eq!(
+        fs::read(tmp.path().join("x/tree/sub/a.txt")).unwrap(),
+        b"hello"
+    );
 }

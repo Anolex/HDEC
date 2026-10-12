@@ -63,6 +63,11 @@ enum Action {
     Extract(PathBuf, ExtractOptions),
     Test,
     Modify(Edit),
+    /// Extract one entry into `dir` and open it with the default app.
+    Preview {
+        entry: String,
+        dir: PathBuf,
+    },
 }
 
 enum Outcome {
@@ -71,6 +76,7 @@ enum Outcome {
     Tested,
     Created(PathBuf),
     Modified,
+    Previewed(PathBuf),
 }
 
 enum Msg {
@@ -100,6 +106,7 @@ enum Dialog {
         from: String,
         name: String,
     },
+    NewFolder(String),
     Password {
         input: Zeroizing<String>,
         then: Action,
@@ -137,12 +144,22 @@ enum SortKey {
     Modified,
 }
 
-/// Context-menu commands on a table row.
-enum RowAction {
+/// What toolbar buttons, context menus, shortcuts and drag & drop ask for.
+enum Command {
+    /// Folder → show it; file → open it with the default app.
+    Open(String),
     Extract,
     Rename,
     Delete,
+    NewFolder,
+    AddFiles,
+    AddFolder,
+    /// Move entries into a folder ("" = root).
+    Move(Vec<String>, String),
 }
+
+/// Drag & drop payload: entry paths being moved inside the archive.
+struct Dragged(Vec<String>);
 
 #[derive(Default)]
 struct App {
@@ -169,6 +186,9 @@ struct App {
     job: Option<Job>,
     dialog: Dialog,
     status: String,
+    /// Where entries opened with the default app are extracted; removed on exit.
+    preview_dir: Option<tempfile::TempDir>,
+    previews: u32,
 }
 
 impl App {
@@ -179,6 +199,7 @@ impl App {
             Action::Extract(..) => ("Extracting", icon::EXPORT),
             Action::Test => ("Testing", icon::CHECK_CIRCLE),
             Action::Modify(_) => ("Updating", icon::PENCIL_SIMPLE),
+            Action::Preview { .. } => ("Opening", icon::FILE),
         };
         let retry = Some(action.clone());
         self.spawn(ctx, verb, icon, retry, password, move |c| match action {
@@ -195,6 +216,16 @@ impl App {
             }
             Action::Modify(edit) => {
                 hdec_core::modify(archive.as_deref().unwrap(), &edit, c).map(|_| Outcome::Modified)
+            }
+            Action::Preview { entry, dir } => {
+                let opts = ExtractOptions {
+                    only: Some(vec![entry.clone()]),
+                    overwrite: Overwrite::Replace,
+                };
+                hdec_core::extract(archive.as_deref().unwrap(), &dir, &opts, c)?;
+                Ok(Outcome::Previewed(hdec_core::safe_path::join(
+                    &dir, &entry,
+                )?))
             }
         });
     }
@@ -309,6 +340,11 @@ impl App {
                 let path = self.archive.clone().unwrap();
                 self.run(ctx, Action::Open(path), self.password.clone());
             }
+            Outcome::Previewed(path) => {
+                if let Err(e) = launch(&path) {
+                    self.dialog = Dialog::Error(format!("Couldn't open {}: {e}", path.display()));
+                }
+            }
         }
     }
 
@@ -318,10 +354,11 @@ impl App {
     }
 
     fn navigate(&mut self, cwd: String) {
-        let mut parent = cwd.as_str();
-        while let Some((p, _)) = parent.rsplit_once('/') {
-            self.expanded.insert(p.to_owned());
-            parent = p;
+        // Reveal the folder in the tree: expand it and all its ancestors.
+        let mut path = cwd.as_str();
+        while !path.is_empty() {
+            self.expanded.insert(path.to_owned());
+            path = parent_of(path);
         }
         self.cwd = cwd;
         self.filter.clear();
@@ -438,6 +475,85 @@ impl App {
         }
     }
 
+    fn command(&mut self, ctx: &egui::Context, command: Command) {
+        if self.job.is_some() || self.archive.is_none() {
+            return;
+        }
+        match command {
+            Command::Open(path) => match self.rows.iter().find(|r| r.path == path) {
+                Some(e) if e.is_dir => self.navigate(path),
+                Some(_) => self.preview(ctx, path),
+                None => {}
+            },
+            Command::Extract => self.start_extract(),
+            Command::Rename => self.start_rename(),
+            Command::Delete => self.start_delete(),
+            Command::NewFolder if self.modifiable => {
+                let taken = |n: &str| self.rows.iter().any(|r| base_name(&r.path) == n);
+                let name = (1..)
+                    .map(|i| {
+                        if i == 1 {
+                            "New folder".to_owned()
+                        } else {
+                            format!("New folder {i}")
+                        }
+                    })
+                    .find(|n| !taken(n))
+                    .unwrap();
+                self.dialog = Dialog::NewFolder(name);
+            }
+            Command::AddFiles if self.modifiable => {
+                if let Some(files) = rfd::FileDialog::new().pick_files() {
+                    self.add(ctx, files);
+                }
+            }
+            Command::AddFolder if self.modifiable => {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    self.add(ctx, vec![dir]);
+                }
+            }
+            Command::Move(paths, into) if self.modifiable => {
+                let pairs: Vec<(String, String)> = paths
+                    .into_iter()
+                    .filter(|p| parent_of(p) != into)
+                    .map(|p| {
+                        let to = join_path(&into, base_name(&p));
+                        (p, to)
+                    })
+                    .collect();
+                if !pairs.is_empty() {
+                    self.run(
+                        ctx,
+                        Action::Modify(Edit::Rename(pairs)),
+                        self.password.clone(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn preview(&mut self, ctx: &egui::Context, entry: String) {
+        if self.preview_dir.is_none() {
+            match tempfile::Builder::new().prefix("hdec-open").tempdir() {
+                Ok(dir) => self.preview_dir = Some(dir),
+                Err(e) => {
+                    self.dialog = Dialog::Error(format!("Couldn't create a temporary folder: {e}"));
+                    return;
+                }
+            }
+        }
+        // A fresh subfolder per open: the previous copy may still be open in another app.
+        self.previews += 1;
+        let dir = self
+            .preview_dir
+            .as_ref()
+            .unwrap()
+            .path()
+            .join(self.previews.to_string());
+        self.run(ctx, Action::Preview { entry, dir }, self.password.clone());
+    }
+
     fn start_rename(&mut self) {
         if let (true, [from]) = (
             self.modifiable,
@@ -488,19 +604,19 @@ impl App {
             theme::tool_separator(ui);
             let add = theme::tool_button(ui, icon::FILE_PLUS, "Add", can_edit, false);
             egui::Popup::menu(&add).show(|ui| {
-                if ui.button(format!("{}  Files…", icon::FILE_PLUS)).clicked()
-                    && let Some(files) = rfd::FileDialog::new().pick_files()
-                {
-                    self.add(ui.ctx(), files);
+                if ui.button(format!("{}  Files…", icon::FILE_PLUS)).clicked() {
+                    self.command(ui.ctx(), Command::AddFiles);
                 }
                 if ui
                     .button(format!("{}  Folder…", icon::FOLDER_PLUS))
                     .clicked()
-                    && let Some(dir) = rfd::FileDialog::new().pick_folder()
                 {
-                    self.add(ui.ctx(), vec![dir]);
+                    self.command(ui.ctx(), Command::AddFolder);
                 }
             });
+            if theme::tool_button(ui, icon::FOLDER_PLUS, "New folder", can_edit, false).clicked() {
+                self.command(ui.ctx(), Command::NewFolder);
+            }
             if theme::tool_button(
                 ui,
                 icon::TRASH,
@@ -555,14 +671,16 @@ impl App {
                 let color = if current { p.text } else { p.muted };
                 ui.add(egui::Button::new(RichText::new(text).color(color)).frame(false))
             };
-            if crumb(
+            let root = crumb(
                 ui,
                 format!("{}  {name}", icon::FILE_ARCHIVE),
                 self.cwd.is_empty(),
-            )
-            .clicked()
-            {
+            );
+            if root.clicked() {
                 self.navigate(String::new());
+            }
+            if let Some(dragged) = drop_target(ui, &root) {
+                self.command(ui.ctx(), Command::Move(dragged, String::new()));
             }
             let mut path = String::new();
             let parts: Vec<String> = self
@@ -578,8 +696,12 @@ impl App {
                     format!("{path}/{part}")
                 };
                 ui.label(RichText::new(icon::CARET_RIGHT).size(11.0).color(p.faint));
-                if crumb(ui, part.clone(), i + 1 == parts.len()).clicked() {
+                let response = crumb(ui, part.clone(), i + 1 == parts.len());
+                if response.clicked() {
                     self.navigate(path.clone());
+                }
+                if let Some(dragged) = drop_target(ui, &response) {
+                    self.command(ui.ctx(), Command::Move(dragged, path.clone()));
                 }
             }
             if !self.filter.is_empty() {
@@ -668,6 +790,9 @@ impl App {
             font,
             p.text,
         );
+        if let Some(dragged) = drop_target(ui, &resp) {
+            self.command(ui.ctx(), Command::Move(dragged, path.clone()));
+        }
         if resp.clicked() {
             let on_caret = resp
                 .interact_pointer_pos()
@@ -691,12 +816,16 @@ impl App {
     fn table(&mut self, ui: &mut egui::Ui) {
         let p = pal(ui.ctx());
         let filtering = !self.filter.is_empty();
-        let mut go_into = None;
         let mut sort_by = None;
-        let mut menu_action = None;
+        let mut action = None;
         let (command, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+        let sense = if self.modifiable {
+            Sense::click_and_drag()
+        } else {
+            Sense::click()
+        };
         TableBuilder::new(ui)
-            .sense(Sense::click())
+            .sense(sense)
             .cell_layout(Layout::left_to_right(Align::Center))
             .column(Column::remainder().at_least(160.0).clip(true))
             .column(Column::exact(86.0))
@@ -748,6 +877,8 @@ impl App {
                         ui.spacing_mut().item_spacing.x = 7.0;
                         if e.is_dir {
                             ui.label(theme::fill(icon::FOLDER).size(16.0).color(p.folder));
+                        } else if e.link.is_some() {
+                            ui.label(RichText::new(icon::LINK_SIMPLE).size(16.0).color(p.accent));
                         } else {
                             ui.label(
                                 RichText::new(theme::file_icon(&e.path))
@@ -760,11 +891,14 @@ impl App {
                         } else {
                             base_name(&e.path)
                         };
-                        ui.add(
-                            egui::Label::new(RichText::new(name).color(p.text))
-                                .truncate()
-                                .selectable(false),
-                        );
+                        let mut text = egui::text::LayoutJob::default();
+                        let font = egui::FontId::proportional(13.0);
+                        text.append(name, 0.0, egui::TextFormat::simple(font.clone(), p.text));
+                        if let Some(target) = e.link.as_deref().filter(|t| !t.is_empty()) {
+                            let arrow = format!("  {}  {target}", icon::ARROW_RIGHT);
+                            text.append(&arrow, 0.0, egui::TextFormat::simple(font, p.muted));
+                        }
+                        ui.add(egui::Label::new(text).truncate().selectable(false));
                         if e.encrypted {
                             ui.label(theme::fill(icon::LOCK_SIMPLE).size(12.0).color(p.folder));
                         }
@@ -777,7 +911,7 @@ impl App {
                     row.col(|ui| {
                         numeric(
                             ui,
-                            if e.is_dir {
+                            if e.is_dir || e.link.is_some() {
                                 String::new()
                             } else {
                                 human_size(e.size)
@@ -788,7 +922,7 @@ impl App {
                         numeric(
                             ui,
                             e.packed
-                                .filter(|_| !e.is_dir)
+                                .filter(|_| !e.is_dir && e.link.is_none())
                                 .map(human_size)
                                 .unwrap_or_default(),
                         )
@@ -815,8 +949,31 @@ impl App {
                     });
 
                     let response = row.response();
-                    if response.double_clicked() && e.is_dir {
-                        go_into = Some(e.path.clone());
+                    if self.modifiable && response.drag_started() {
+                        let paths = if self.selected.contains(&e.path) {
+                            self.selected.iter().cloned().collect()
+                        } else {
+                            vec![e.path.clone()]
+                        };
+                        response.dnd_set_drag_payload(Dragged(paths));
+                    }
+                    if e.is_dir {
+                        if response.dnd_hover_payload::<Dragged>().is_some() {
+                            let stroke = egui::Stroke::new(1.5, p.accent);
+                            let painter = response.ctx.layer_painter(response.layer_id);
+                            painter.rect_stroke(
+                                response.rect,
+                                6.0,
+                                stroke,
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        if let Some(dragged) = response.dnd_release_payload::<Dragged>() {
+                            action = Some(Command::Move(dragged.0.clone(), e.path.clone()));
+                        }
+                    }
+                    if response.double_clicked() {
+                        action = Some(Command::Open(e.path.clone()));
                     } else if response.clicked()
                         || (response.secondary_clicked() && !self.selected.contains(&e.path))
                     {
@@ -840,19 +997,27 @@ impl App {
                         }
                     }
                     response.context_menu(|ui| {
-                        if e.is_dir && ui.button(format!("{}  Open", icon::FOLDER_OPEN)).clicked() {
-                            go_into = Some(e.path.clone());
+                        let open = if e.is_dir {
+                            icon::FOLDER_OPEN
+                        } else {
+                            icon::ARROW_SQUARE_OUT
+                        };
+                        if ui.button(format!("{open}  Open")).clicked() {
+                            action = Some(Command::Open(e.path.clone()));
                         }
                         if ui.button(format!("{}  Extract…", icon::EXPORT)).clicked() {
-                            menu_action = Some(RowAction::Extract);
+                            action = Some(Command::Extract);
                         }
                         if self.modifiable {
                             ui.separator();
                             if ui
-                                .button(format!("{}  Rename…", icon::PENCIL_SIMPLE))
+                                .add_enabled(
+                                    self.selected.len() == 1,
+                                    egui::Button::new(format!("{}  Rename…", icon::PENCIL_SIMPLE)),
+                                )
                                 .clicked()
                             {
-                                menu_action = Some(RowAction::Rename);
+                                action = Some(Command::Rename);
                             }
                             if ui
                                 .button(
@@ -861,7 +1026,7 @@ impl App {
                                 )
                                 .clicked()
                             {
-                                menu_action = Some(RowAction::Delete);
+                                action = Some(Command::Delete);
                             }
                         }
                     });
@@ -876,14 +1041,38 @@ impl App {
             sort_rows(&mut self.rows, self.sort, self.descending);
             self.anchor = None;
         }
-        match menu_action {
-            Some(RowAction::Extract) => self.start_extract(),
-            Some(RowAction::Rename) => self.start_rename(),
-            Some(RowAction::Delete) => self.start_delete(),
-            None => {}
+        // Space below the rows: click clears the selection, right-click offers folder actions.
+        let rest = ui.available_rect_before_wrap();
+        if rest.height() > 0.0 {
+            let response = ui.interact(rest, ui.id().with("below-rows"), Sense::click());
+            if response.clicked() {
+                self.selected.clear();
+            }
+            if self.modifiable {
+                response.context_menu(|ui| {
+                    if ui
+                        .button(format!("{}  New folder…", icon::FOLDER_PLUS))
+                        .clicked()
+                    {
+                        action = Some(Command::NewFolder);
+                    }
+                    if ui
+                        .button(format!("{}  Add files…", icon::FILE_PLUS))
+                        .clicked()
+                    {
+                        action = Some(Command::AddFiles);
+                    }
+                    if ui
+                        .button(format!("{}  Add folder…", icon::FOLDER_PLUS))
+                        .clicked()
+                    {
+                        action = Some(Command::AddFolder);
+                    }
+                });
+            }
         }
-        if let Some(dir) = go_into {
-            self.navigate(dir);
+        if let Some(action) = action {
+            self.command(ui.ctx(), action);
         }
     }
 
@@ -1014,9 +1203,9 @@ impl App {
             egui::StrokeKind::Inside,
         );
         let text = if self.modifiable {
-            "Drop to open an archive or add files"
+            format!("Add to “/{}”", self.cwd)
         } else {
-            "Drop to open or create an archive"
+            "Drop to open or create an archive".to_owned()
         };
         painter.text(
             rect.center(),
@@ -1035,15 +1224,23 @@ impl App {
         {
             return;
         }
-        let (up, all, delete, enter) = ctx.input(|i| {
+        let (up, all, delete, enter, rename, new_folder) = ctx.input(|i| {
             (
                 i.key_pressed(Key::Backspace) && !i.modifiers.command,
                 i.key_pressed(Key::A) && i.modifiers.command,
                 i.key_pressed(Key::Delete)
                     || (i.key_pressed(Key::Backspace) && i.modifiers.command),
                 i.key_pressed(Key::Enter),
+                i.key_pressed(Key::F2),
+                i.key_pressed(Key::N) && i.modifiers.command && i.modifiers.shift,
             )
         });
+        if rename {
+            self.command(ctx, Command::Rename);
+        }
+        if new_folder {
+            self.command(ctx, Command::NewFolder);
+        }
         if up && !self.cwd.is_empty() {
             self.go_up();
         }
@@ -1053,16 +1250,9 @@ impl App {
         if delete {
             self.start_delete();
         }
-        if enter
-            && let [dir] = self
-                .rows
-                .iter()
-                .filter(|r| r.is_dir && self.selected.contains(&r.path))
-                .collect::<Vec<_>>()
-                .as_slice()
-        {
-            let dir = dir.path.clone();
-            self.navigate(dir);
+        if enter && let [one] = self.selected.iter().collect::<Vec<_>>().as_slice() {
+            let one = (*one).clone();
+            self.command(ctx, Command::Open(one));
         }
     }
 
@@ -1119,8 +1309,7 @@ impl App {
                     let field =
                         ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY));
                     let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                    let valid =
-                        !name.is_empty() && !name.contains('/') && name != "." && name != "..";
+                    let valid = valid_name(&name);
                     let mut result = None;
                     theme::dialog_footer(ui, |ui| {
                         if theme::primary_button(ui, "Rename", valid).clicked() || (enter && valid)
@@ -1141,13 +1330,49 @@ impl App {
                         };
                         self.run(
                             ctx,
-                            Action::Modify(Edit::Rename { from, to }),
+                            Action::Modify(Edit::Rename(vec![(from, to)])),
                             self.password.clone(),
                         );
                         Dialog::None
                     }
                     Some(false) => Dialog::None,
                     None => Dialog::Rename { from, name },
+                }
+            }
+            Dialog::NewFolder(mut name) => {
+                let place = format!("In /{}", self.cwd);
+                let result = theme::dialog(ctx, icon::FOLDER_PLUS, "New folder", &place, |ui| {
+                    let field =
+                        ui.add(egui::TextEdit::singleline(&mut name).desired_width(f32::INFINITY));
+                    if !field.has_focus() && !field.lost_focus() {
+                        field.request_focus();
+                    }
+                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    let valid = valid_name(&name);
+                    let mut result = None;
+                    theme::dialog_footer(ui, |ui| {
+                        if theme::primary_button(ui, "Create", valid).clicked() || (enter && valid)
+                        {
+                            result = Some(true);
+                        }
+                        if theme::button(ui, "Cancel").clicked() {
+                            result = Some(false);
+                        }
+                    });
+                    result
+                });
+                match result {
+                    Some(true) => {
+                        let dir = join_path(&self.cwd, name.trim());
+                        self.run(
+                            ctx,
+                            Action::Modify(Edit::CreateDir(dir)),
+                            self.password.clone(),
+                        );
+                        Dialog::None
+                    }
+                    Some(false) => Dialog::None,
+                    None => Dialog::NewFolder(name),
                 }
             }
             Dialog::Password {
@@ -1305,10 +1530,11 @@ impl eframe::App for App {
         });
         if !dropped.is_empty() && self.job.is_none() {
             match dropped.as_slice() {
+                // An editable archive is open: everything dropped goes into it.
+                _ if self.modifiable => self.add(&ctx, dropped),
                 [one] if one.is_file() && hdec_core::detect(one).is_ok() => {
                     self.open(&ctx, one.clone())
                 }
-                _ if self.modifiable => self.add(&ctx, dropped),
                 _ => self.new_archive(dropped),
             }
         }
@@ -1358,6 +1584,7 @@ impl eframe::App for App {
             });
         self.dialogs(&ctx);
         self.drop_overlay(&ctx);
+        drag_preview(&ctx);
     }
 }
 
@@ -1535,6 +1762,80 @@ fn create_form(ui: &mut egui::Ui, form: &mut CreateForm) -> Option<bool> {
     result
 }
 
+/// Accepts a dropped `Dragged` payload on `response`, highlighting it while hovered.
+fn drop_target(ui: &egui::Ui, response: &egui::Response) -> Option<Vec<String>> {
+    if response.dnd_hover_payload::<Dragged>().is_some() {
+        let stroke = egui::Stroke::new(1.5, pal(ui.ctx()).accent);
+        ui.painter()
+            .rect_stroke(response.rect, 6.0, stroke, egui::StrokeKind::Inside);
+    }
+    response
+        .dnd_release_payload::<Dragged>()
+        .map(|d| d.0.clone())
+}
+
+/// "Move N items" label following the pointer while entries are dragged.
+fn drag_preview(ctx: &egui::Context) {
+    let (Some(dragged), Some(pos)) = (
+        egui::DragAndDrop::payload::<Dragged>(ctx),
+        ctx.pointer_latest_pos(),
+    ) else {
+        return;
+    };
+    let p = pal(ctx);
+    let text = match dragged.0.as_slice() {
+        [one] => format!("{}  {}", icon::ARROWS_OUT_CARDINAL, base_name(one)),
+        many => format!("{}  {} items", icon::ARROWS_OUT_CARDINAL, many.len()),
+    };
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("drag"),
+    ));
+    let galley = painter.layout_no_wrap(text, egui::FontId::proportional(13.0), p.text);
+    let rect =
+        egui::Rect::from_min_size(pos + vec2(14.0, 10.0), galley.size()).expand2(vec2(8.0, 4.0));
+    painter.rect_filled(rect, 6.0, p.panel);
+    painter.rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(1.0, p.accent),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(rect.min + vec2(8.0, 4.0), galley, p.text);
+}
+
+/// Opens a file with the system's default app.
+fn launch(path: &Path) -> std::io::Result<()> {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(program)
+        .arg(path)
+        .spawn()
+        .map(drop)
+}
+
+fn valid_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != ".."
+}
+
+fn parent_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+fn join_path(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
 fn base_name(path: &str) -> &str {
     path.trim_end_matches(['/', '\\'])
         .rsplit(['/', '\\'])
@@ -1565,6 +1866,7 @@ fn children(entries: &[Entry], cwd: &str) -> Vec<Entry> {
                     modified: None,
                     is_dir: true,
                     encrypted: false,
+                    link: None,
                 });
             }
             None if e.is_dir => {
@@ -1599,7 +1901,7 @@ fn dir_tree(entries: &[Entry]) -> BTreeMap<String, Vec<String>> {
 }
 
 fn ratio(e: &Entry) -> Option<f64> {
-    (!e.is_dir && e.size > 0).then_some(e.packed? as f64 / e.size as f64)
+    (!e.is_dir && e.link.is_none() && e.size > 0).then_some(e.packed? as f64 / e.size as f64)
 }
 
 /// Folders first, then by `key`; names break ties.
@@ -1674,6 +1976,7 @@ mod tests {
             modified: None,
             is_dir,
             encrypted: false,
+            link: None,
         }
     }
 
@@ -1724,6 +2027,74 @@ mod tests {
         assert_eq!(names(&rows), ["Dir", "big", "a", "small"]);
     }
 
+    /// Runs background jobs (and the reload that follows an edit) to completion.
+    fn pump(app: &mut App, ctx: &egui::Context) {
+        for _ in 0..1000 {
+            app.poll_job(ctx);
+            if app.job.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("job didn't finish");
+    }
+
+    #[test]
+    fn file_manager_commands_edit_the_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("t.zip");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../hdec-core/tests/fixtures/infozip.zip");
+        std::fs::copy(fixture, &archive).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open(&ctx, archive);
+        pump(&mut app, &ctx);
+        assert!(app.modifiable);
+        let has = |app: &App, p: &str| app.entries.iter().any(|e| e.path == p);
+
+        app.navigate("tree".into());
+        app.command(
+            &ctx,
+            Command::Move(vec!["tree/a.txt".into()], "tree/sub".into()),
+        );
+        pump(&mut app, &ctx);
+        if let Dialog::Error(e) = &app.dialog {
+            panic!("{e}")
+        }
+        assert!(
+            has(&app, "tree/sub/a.txt") && !has(&app, "tree/a.txt"),
+            "{:?}",
+            app.entries.iter().map(|e| &e.path).collect::<Vec<_>>()
+        );
+        assert_eq!(app.cwd, "tree", "stays in the folder after reload");
+
+        app.run(
+            &ctx,
+            Action::Modify(Edit::CreateDir("tree/fresh".into())),
+            None,
+        );
+        pump(&mut app, &ctx);
+        assert!(has(&app, "tree/fresh"));
+
+        app.run(
+            &ctx,
+            Action::Modify(Edit::Delete(vec!["tree/sub".into()])),
+            None,
+        );
+        pump(&mut app, &ctx);
+        assert!(!has(&app, "tree/sub/a.txt") && !has(&app, "tree/sub/b.txt"));
+
+        // Moving a folder into itself is refused with a message, archive untouched.
+        app.command(
+            &ctx,
+            Command::Move(vec!["tree".into()], "tree/fresh".into()),
+        );
+        pump(&mut app, &ctx);
+        assert!(matches!(app.dialog, Dialog::Error(_)));
+        assert!(has(&app, "tree/fresh"));
+    }
+
     /// Renders each UI state to `target/ui-shots/*.png` for eyeballing.
     /// Run with `cargo test -p hdec-gui -- --ignored screenshots`.
     #[test]
@@ -1748,7 +2119,18 @@ mod tests {
             app.navigate("tree/sub".into());
             app.selected.insert("tree/sub/b.txt".into());
         };
-        let states: [(&str, Setup); 7] = [
+        let states: [(&str, Setup); 9] = [
+            ("links", |app, ctx, path, entries| {
+                app.finish(ctx, Outcome::Opened(path.to_path_buf(), entries.to_vec()));
+                app.navigate("tree".into());
+            }),
+            ("newfolder", |app, ctx, path, entries| {
+                app.finish(ctx, Outcome::Opened(path.to_path_buf(), entries.to_vec()));
+                app.modifiable = true; // pretend: shows the edit toolbar enabled
+                app.navigate("tree".into());
+                app.selected.insert("tree/a.txt".into());
+                app.command(ctx, Command::NewFolder);
+            }),
             ("empty", |_, _, _, _| {}),
             ("opened", opened),
             ("extract", |app, ctx, path, entries| {

@@ -162,6 +162,7 @@ pub fn list(path: &Path, format: Format) -> Result<Vec<Entry>> {
         modified: meta.modified().ok(),
         is_dir: false,
         encrypted: false,
+        link: None,
     }])
 }
 

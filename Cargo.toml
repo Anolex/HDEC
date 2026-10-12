@@ -9,7 +9,7 @@ edition = "2024"
 [workspace.dependencies]
 hdec-core = { path = "crates/hdec-core" }
 # zip: never enable `zstd` (C). Rust backends only: zlib-rs, libbz2-rs-sys, lzma-rust2.
-zip = { version = "9.0.1", default-features = false, features = ["aes-crypto", "bzip2", "deflate-flate2-zlib-rs", "deflate64", "lzma", "xz", "ppmd", "jiff-02"] }
+zip = { version = "9.0.1", default-features = false, features = ["aes-crypto", "bzip2", "deflate-flate2-zlib-rs", "deflate64", "lzma", "xz", "ppmd", "jiff-02", "unreserved"] }
 jiff = "0.2"
 tar = "0.4.46"
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }

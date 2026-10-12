@@ -129,6 +129,10 @@ pub fn list(path: &Path, ctx: &Ctx) -> Result<Vec<Entry>> {
             modified: m.meta.modification_time(),
             is_dir: m.meta.is_directory,
             encrypted: m.meta.is_encrypted,
+            link: symlink_target(m).or_else(|| {
+                let unix = matches!(m.meta.attr_source(), AttrSource::Unix);
+                (unix && m.meta.file_attr & S_IFMT == S_IFLNK).then(String::new)
+            }),
         })
         .collect())
 }

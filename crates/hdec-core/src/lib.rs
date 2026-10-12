@@ -138,6 +138,9 @@ pub struct Entry {
     pub modified: Option<SystemTime>,
     pub is_dir: bool,
     pub encrypted: bool,
+    /// Symlink target. `Some("")` when the format marks a link but storing
+    /// the target in the (compressed) data, which listing doesn't decode.
+    pub link: Option<String>,
 }
 
 /// `progress(done_bytes, total_bytes, current_entry)`.
@@ -212,8 +215,10 @@ pub enum Edit {
     Add { sources: Vec<PathBuf>, into: String },
     /// Remove entries; a folder removes everything below it.
     Delete(Vec<String>),
-    /// Rename or move one entry or folder; `to` is the full new path.
-    Rename { from: String, to: String },
+    /// Rename or move entries/folders: `(from, to)` with full paths.
+    Rename(Vec<(String, String)>),
+    /// Create an empty folder (full path).
+    CreateDir(String),
 }
 
 pub fn list(path: &Path, ctx: &Ctx) -> Result<Vec<Entry>> {
@@ -313,10 +318,57 @@ pub fn modify(path: &Path, edit: &Edit, ctx: &Ctx) -> Result<()> {
             path.display()
         )));
     }
+    check_edit(edit, &names_with_parents(&list(path, ctx)?))?;
     match detect(path)? {
         Format::Zip => formats::zip::modify(path, edit, ctx),
         format => rewrite(path, format, edit, ctx),
     }
+}
+
+/// Every entry path plus every folder implied by a deeper path.
+fn names_with_parents(entries: &[Entry]) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for e in entries {
+        let mut path = e.path.as_str();
+        names.insert(path.to_owned());
+        while let Some((parent, _)) = path.rsplit_once('/') {
+            names.insert(parent.to_owned());
+            path = parent;
+        }
+    }
+    names
+}
+
+/// Rejects edits that would clobber, duplicate or nest entries into themselves.
+fn check_edit(edit: &Edit, existing: &std::collections::BTreeSet<String>) -> Result<()> {
+    let refuse = |msg: String| Err(Error::Unsupported(msg));
+    let valid = |name: &str| safe_path::join(Path::new("/"), name).is_ok() && !name.ends_with('/');
+    match edit {
+        Edit::Rename(pairs) => {
+            for (from, to) in pairs {
+                if !valid(to) {
+                    return refuse(format!("“{to}” is not a valid name"));
+                }
+                if !existing.contains(from) {
+                    return refuse(format!("“{from}” is not in the archive"));
+                }
+                if to.starts_with(&format!("{from}/")) {
+                    return refuse(format!("can't move “{from}” into itself"));
+                }
+                if to != from && existing.contains(to) {
+                    return refuse(format!("“{to}” already exists"));
+                }
+            }
+        }
+        Edit::CreateDir(dir) if !valid(dir) => {
+            return refuse(format!("“{dir}” is not a valid name"));
+        }
+        Edit::CreateDir(dir) if existing.contains(dir) => {
+            return refuse(format!("“{dir}” already exists"));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Generic modify: extract next to the archive, edit the files, re-create.
@@ -357,11 +409,14 @@ fn rewrite(path: &Path, format: Format, edit: &Edit, ctx: &Ctx) -> Result<()> {
                 }
             }
         }
-        Edit::Rename { from, to } => {
-            let (from, to) = (safe_path::join(root, from)?, safe_path::join(root, to)?);
-            fs::make_dirs(root, to.parent().unwrap_or(root))?;
-            std::fs::rename(from, to)?;
+        Edit::Rename(pairs) => {
+            for (from, to) in pairs {
+                let (from, to) = (safe_path::join(root, from)?, safe_path::join(root, to)?);
+                fs::make_dirs(root, to.parent().unwrap_or(root))?;
+                std::fs::rename(from, to)?;
+            }
         }
+        Edit::CreateDir(dir) => fs::make_dirs(root, &safe_path::join(root, dir)?)?,
     }
     let mut sources = std::fs::read_dir(root)?
         .map(|e| e.map(|e| e.path()))
