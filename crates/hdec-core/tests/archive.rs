@@ -1500,3 +1500,100 @@ fn symlink_chains_and_hard_links_cant_escape() {
     assert_eq!(fs::read(tmp.path().join("secret")).unwrap(), b"outside");
     assert_eq!(warnings.len(), 3, "{warnings:?}");
 }
+
+#[cfg(unix)]
+#[test]
+fn named_pipes_in_sources_are_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("tree");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("a.txt"), "hi").unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(src.join("pipe"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let cancel = AtomicBool::new(false);
+    let c = ctx(None, &cancel);
+    for format in [Format::Zip, Format::SevenZ, Format::Rar, Format::TarGz] {
+        let archive = tmp.path().join(format!("out.{}", format.extension()));
+        let opts = CreateOptions {
+            format,
+            ..Default::default()
+        };
+        // Reading the pipe would block forever.
+        hdec_core::create(std::slice::from_ref(&src), &archive, &opts, &c).unwrap();
+        let names: Vec<_> = hdec_core::list(&archive, &c)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert!(names.contains(&"tree/a.txt".to_owned()), "{format:?}");
+        assert!(!names.contains(&"tree/pipe".to_owned()), "{format:?}");
+    }
+    // Adding a folder with a pipe to an existing archive (full rewrite).
+    let archive = tmp.path().join("out.7z");
+    hdec_core::modify(
+        &archive,
+        &hdec_core::Edit::Add {
+            sources: vec![src.clone()],
+            into: "again".into(),
+        },
+        &c,
+    )
+    .unwrap();
+}
+
+#[test]
+fn sources_with_the_same_name_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    for dir in ["a", "b"] {
+        fs::create_dir(tmp.path().join(dir)).unwrap();
+        fs::write(tmp.path().join(dir).join("notes.txt"), dir).unwrap();
+    }
+    let sources = [
+        tmp.path().join("a/notes.txt"),
+        tmp.path().join("b/notes.txt"),
+    ];
+    let cancel = AtomicBool::new(false);
+    let c = ctx(None, &cancel);
+    for format in [Format::Zip, Format::SevenZ, Format::Rar, Format::TarGz] {
+        let archive = tmp.path().join(format!("out.{}", format.extension()));
+        let opts = CreateOptions {
+            format,
+            ..Default::default()
+        };
+        let r = hdec_core::create(&sources, &archive, &opts, &c);
+        assert!(matches!(r, Err(Error::Unsupported(_))), "{format:?}: {r:?}");
+        assert!(!archive.exists(), "{format:?}");
+        // Adding them to an existing archive is refused the same way.
+        hdec_core::create(&sources[..1], &archive, &opts, &c).unwrap();
+        let add = hdec_core::Edit::Add {
+            sources: sources.to_vec(),
+            into: String::new(),
+        };
+        let r = hdec_core::modify(&archive, &add, &c);
+        assert!(matches!(r, Err(Error::Unsupported(_))), "{format:?}: {r:?}");
+        fs::remove_file(&archive).unwrap();
+    }
+}
+
+#[test]
+fn editing_a_tar_keeps_the_last_of_duplicate_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("dup.tar");
+    let mut b = tar::Builder::new(fs::File::create(&archive).unwrap());
+    for data in [&b"old"[..], b"new"] {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        b.append_data(&mut h, "x.txt", data).unwrap();
+    }
+    b.into_inner().unwrap();
+    let cancel = AtomicBool::new(false);
+    let c = ctx(None, &cancel);
+    hdec_core::modify(&archive, &hdec_core::Edit::CreateDir("d".into()), &c).unwrap();
+    let out = tmp.path().join("out");
+    extract(&archive, &out, None).unwrap();
+    assert_eq!(fs::read(out.join("x.txt")).unwrap(), b"new");
+}

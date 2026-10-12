@@ -1474,6 +1474,7 @@ impl App {
         if self.archive.is_none()
             || self.job.is_some()
             || !matches!(self.dialog, Dialog::None)
+            || self.picker.is_some()
             || ctx.memory(|m| m.focused().is_some())
         {
             return;
@@ -1592,15 +1593,15 @@ impl App {
                 );
                 match result {
                     Some(true) => {
-                        let to = match from.rsplit_once('/') {
-                            Some((parent, _)) => format!("{parent}/{name}"),
-                            None => name,
-                        };
-                        self.run(
-                            ctx,
-                            Action::Modify(Edit::Rename(vec![(from, to)])),
-                            self.password.clone(),
-                        );
+                        let to = join_path(parent_of(&from), name.trim());
+                        // Unchanged: nothing to do (7Z/TAR/RAR would be rewritten whole).
+                        if to != from {
+                            self.run(
+                                ctx,
+                                Action::Modify(Edit::Rename(vec![(from, to)])),
+                                self.password.clone(),
+                            );
+                        }
                         Dialog::None
                     }
                     Some(false) => Dialog::None,
@@ -1890,6 +1891,8 @@ impl eframe::App for App {
                 _ if let Dialog::Create(form) = &mut self.dialog => {
                     add_sources(&mut form.sources, dropped)
                 }
+                // Another dialog is up (rename, password, unsaved changes…): not now.
+                _ if !matches!(self.dialog, Dialog::None) || self.picker.is_some() => {}
                 // An editable archive is open: everything dropped goes into it.
                 _ if self.modifiable => self.add(&ctx, dropped),
                 [one] if one.is_file() && hdec_core::detect(one).is_ok() => {

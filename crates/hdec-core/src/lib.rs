@@ -368,6 +368,7 @@ fn check_edit(edit: &Edit, existing: &std::collections::BTreeSet<String>) -> Res
                 }
             }
         }
+        Edit::Add { sources, .. } => fs::unique_names(sources)?,
         Edit::CreateDir(dir) if !valid(dir) => {
             return refuse(format!("“{dir}” is not a valid name"));
         }
@@ -388,7 +389,12 @@ fn rewrite(path: &Path, format: Format, edit: &Edit, ctx: &Ctx) -> Result<()> {
         .tempdir_in(path.parent().unwrap_or(Path::new(".")))?;
     let root = &scratch.path().join("files");
     std::fs::create_dir(root)?;
-    let warnings = extract(path, root, &ExtractOptions::default(), ctx)?;
+    // Replace: of two entries with one name the later wins, as in TAR.
+    let all = ExtractOptions {
+        only: None,
+        overwrite: Overwrite::Replace,
+    };
+    let warnings = extract(path, root, &all, ctx)?;
     if let Some(w) = warnings.first() {
         return Err(Error::Unsupported(format!(
             "refusing to modify, an entry can't be extracted safely: {w}"

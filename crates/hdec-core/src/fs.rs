@@ -556,8 +556,10 @@ pub(crate) struct Source {
     pub meta: Metadata,
 }
 
-/// Expands sources depth-first (parents before children, sorted). Symlinks are not followed.
+/// Expands sources depth-first (parents before children, sorted). Symlinks are
+/// not followed; pipes, sockets and devices are left out.
 pub(crate) fn walk(sources: &[PathBuf]) -> Result<Vec<Source>> {
+    unique_names(sources)?;
     let mut out = Vec::new();
     for src in sources {
         let name = src
@@ -578,6 +580,10 @@ pub(crate) fn walk(sources: &[PathBuf]) -> Result<Vec<Source>> {
 fn walk_into(path: PathBuf, name: String, out: &mut Vec<Source>) -> Result<()> {
     let meta = fs::symlink_metadata(&path)?;
     let is_dir = meta.is_dir();
+    if !is_dir && !meta.is_file() && !meta.is_symlink() {
+        // Pipes, sockets, devices: reading a pipe would block forever.
+        return Ok(());
+    }
     out.push(Source {
         path: path.clone(),
         name: name.clone(),
@@ -592,6 +598,23 @@ fn walk_into(path: PathBuf, name: String, out: &mut Vec<Source>) -> Result<()> {
                 format!("{name}/{}", k.file_name().to_string_lossy()),
                 out,
             )?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuses sources that would land on the same name in the archive
+/// (`a/notes.txt` and `b/notes.txt`).
+pub(crate) fn unique_names(sources: &[PathBuf]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for src in sources {
+        if let Some(name) = src.file_name()
+            && !seen.insert(name)
+        {
+            return Err(Error::Unsupported(format!(
+                "two items are named “{}”: rename one or put them in separate folders",
+                name.to_string_lossy()
+            )));
         }
     }
     Ok(())
@@ -613,7 +636,7 @@ pub(crate) fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         }
         #[cfg(unix)]
         std::os::unix::fs::symlink(fs::read_link(src)?, dst)?;
-    } else {
+    } else if meta.is_file() {
         fs::copy(src, dst)?;
         File::options()
             .write(true)
