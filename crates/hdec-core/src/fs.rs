@@ -2,7 +2,7 @@
 //! extraction writer (cached folder checks, a pool of writer threads), and
 //! walking source trees.
 
-use crate::{Ctx, Error, Overwrite, Result, safe_path};
+use crate::{Ctx, Error, ExtractOptions, Overwrite, Result, safe_path};
 use std::collections::HashSet;
 use std::fs::{self, File, Metadata};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -211,6 +211,8 @@ impl Target {
 pub(crate) struct Extractor {
     dest: PathBuf,
     overwrite: Overwrite,
+    /// `ExtractOptions::flatten`: the selected items whose folders are dropped.
+    flatten: Option<Vec<String>>,
     /// Folders known to be real directories (created or checked).
     dirs: HashSet<PathBuf>,
     /// Folders this run created: nothing in them predates us.
@@ -224,11 +226,12 @@ pub(crate) struct Extractor {
 }
 
 impl Extractor {
-    pub fn new(dest: &Path, overwrite: Overwrite, ctx: &Ctx) -> Result<Self> {
+    pub fn new(dest: &Path, opts: &ExtractOptions, ctx: &Ctx) -> Result<Self> {
         fs::create_dir_all(dest)?;
         Ok(Self {
             dest: dest.to_path_buf(),
-            overwrite,
+            overwrite: opts.overwrite,
+            flatten: opts.only.clone().filter(|_| opts.flatten),
             dirs: HashSet::from([dest.to_path_buf()]),
             created: HashSet::new(),
             claimed: HashSet::new(),
@@ -238,8 +241,27 @@ impl Extractor {
         })
     }
 
+    /// Where entry `name` goes below `dest`. Flattened, that's below its
+    /// outermost selected item's parent folder.
+    fn place<'n>(&self, name: &'n str) -> Result<&'n str> {
+        let Some(only) = &self.flatten else {
+            return Ok(name);
+        };
+        let trimmed = name.trim_end_matches('/');
+        only.iter()
+            .filter(|s| {
+                trimmed
+                    .strip_prefix(s.as_str())
+                    .is_some_and(|r| r.is_empty() || r.starts_with('/'))
+            })
+            .map(|s| s.rfind('/').map_or(0, |i| i + 1))
+            .min()
+            .map(|skip| &name[skip..])
+            .ok_or_else(|| Error::UnsafePath(name.to_owned()))
+    }
+
     pub fn dir(&mut self, name: &str) -> Result<()> {
-        let dir = safe_path::join(&self.dest, name)?;
+        let dir = safe_path::join(&self.dest, self.place(name)?)?;
         self.make_dirs(&dir)
     }
 
@@ -277,7 +299,7 @@ impl Extractor {
     /// Resolves where entry `name` goes. `None` = skip (exists, policy Skip).
     pub fn target(&mut self, name: &str) -> Result<Option<Target>> {
         self.pool.check()?;
-        let path = safe_path::join(&self.dest, name)?;
+        let path = safe_path::join(&self.dest, self.place(name)?)?;
         let parent = path.parent().unwrap_or(&self.dest).to_path_buf();
         self.make_dirs(&parent)?;
         let claimed = self.claimed.contains(&path);
@@ -345,7 +367,13 @@ impl Extractor {
 
     /// Hard link to `target`, an earlier entry's name.
     pub fn hard_link(&mut self, name: &str, target: &str) -> Result<()> {
-        let target = safe_path::join(&self.dest, target)?;
+        // Flattened, a target outside the selection has no place: skip the link.
+        let Ok(placed) = self.place(target) else {
+            self.warnings
+                .push(format!("skipped hard link {name} -> {target}"));
+            return Ok(());
+        };
+        let target = safe_path::join(&self.dest, placed)?;
         if let Some(t) = self.target(name)? {
             self.links.push((name.to_owned(), t.path, target));
         }

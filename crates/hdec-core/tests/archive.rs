@@ -240,6 +240,7 @@ fn overwrite_policies() {
             &ExtractOptions {
                 only: None,
                 overwrite,
+                ..Default::default()
             },
             &c,
         )
@@ -576,6 +577,37 @@ fn sevenz_extracts_selection_from_solid_block() {
         fs::read(tmp.path().join("tree/sub/deeper/big.bin")).unwrap()
     );
     assert!(!out.join("tree/a.txt").exists());
+}
+
+#[test]
+fn flatten_drops_the_folders_above_the_selection() {
+    for format in [Format::Zip, Format::SevenZ, Format::Rar, Format::TarGz] {
+        let (tmp, src, archive) = create(format, Level::Fast, false, None);
+        let out = tmp.path().join("x");
+        fs::create_dir(&out).unwrap();
+        // Taken already: kept, the extracted one gets another name.
+        fs::write(out.join("a.txt"), "mine").unwrap();
+        let opts = ExtractOptions {
+            only: Some(vec!["tree/sub/deeper".into(), "tree/a.txt".into()]),
+            overwrite: Overwrite::Rename,
+            flatten: true,
+        };
+        let cancel = AtomicBool::new(false);
+        let warnings = hdec_core::extract(&archive, &out, &opts, &ctx(None, &cancel)).unwrap();
+        assert!(warnings.is_empty(), "{format:?}: {warnings:?}");
+        assert_eq!(
+            snapshot(&out.join("deeper")),
+            snapshot(&src.join("sub/deeper")),
+            "{format:?}"
+        );
+        assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"mine", "{format:?}");
+        assert_eq!(
+            fs::read(out.join("a (1).txt")).unwrap(),
+            b"hello",
+            "{format:?}"
+        );
+        assert!(!out.join("tree").exists(), "{format:?}");
+    }
 }
 
 #[test]
@@ -1271,6 +1303,7 @@ fn duplicate_names_follow_the_overwrite_policy() {
         let opts = ExtractOptions {
             only: None,
             overwrite,
+            ..Default::default()
         };
         hdec_core::extract(&archive, &out, &opts, &ctx(None, &cancel)).unwrap();
         assert_eq!(
@@ -1404,6 +1437,7 @@ fn colliding_names_dont_abort_extraction() {
         let opts = ExtractOptions {
             only: None,
             overwrite,
+            ..Default::default()
         };
         let result = hdec_core::extract(&archive, &out, &opts, &ctx(None, &cancel));
         assert!(result.is_ok(), "{overwrite:?}: {result:?}");
@@ -1721,6 +1755,7 @@ fn single_file_streams_report_skips() {
     let opts = ExtractOptions {
         only: None,
         overwrite: Overwrite::Replace,
+        ..Default::default()
     };
     let warnings = hdec_core::extract(&archive, &out, &opts, &c).unwrap();
     assert_eq!(warnings.len(), 1, "{warnings:?}");

@@ -666,7 +666,7 @@ pub fn extract(
             Ok(Vec::new())
         }
         Some(dest) => {
-            let mut x = Extractor::new(dest, opts.overwrite, ctx)?;
+            let mut x = Extractor::new(dest, opts, ctx)?;
             if let Some(mut out) = x.file(&name, u64::MAX)? {
                 meter.copy(&name, r, &mut out)?;
                 out.finish(None, None)?;

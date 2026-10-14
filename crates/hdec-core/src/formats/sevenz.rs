@@ -127,9 +127,7 @@ pub fn extract(
         .map(|f| f.size)
         .sum();
     let mut meter = Meter::new(ctx, total);
-    let mut x = dest
-        .map(|d| Extractor::new(d, opts.overwrite, ctx))
-        .transpose()?;
+    let mut x = dest.map(|d| Extractor::new(d, opts, ctx)).transpose()?;
     let mut failure = None;
     reader
         .for_each_entries(|f, mut r| {

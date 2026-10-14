@@ -82,9 +82,7 @@ pub fn extract(
     });
     decode_ahead(format, input, |r| {
         let mut archive = tar::Archive::new(r);
-        let mut x = dest
-            .map(|d| Extractor::new(d, opts.overwrite, ctx))
-            .transpose()?;
+        let mut x = dest.map(|d| Extractor::new(d, opts, ctx)).transpose()?;
         for entry in archive.entries()? {
             ctx.check()?;
             let mut entry = entry?;

@@ -246,9 +246,7 @@ pub fn extract(
         .sum();
     let done = Rc::new(Cell::new(0));
     let throttle = Rc::new(crate::Throttle::new());
-    let mut x = dest
-        .map(|d| Extractor::new(d, opts.overwrite, ctx))
-        .transpose()?;
+    let mut x = dest.map(|d| Extractor::new(d, opts, ctx)).transpose()?;
     let mut pending = None;
     let mut failure = None;
 
