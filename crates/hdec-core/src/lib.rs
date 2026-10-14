@@ -185,6 +185,9 @@ pub struct ExtractOptions {
     /// Entry paths to extract (a directory selects everything below it); `None` = all.
     pub only: Option<Vec<String>>,
     pub overwrite: Overwrite,
+    /// Each `only` item lands in `dest` under its own name, without the
+    /// archive folders above it (`a/b/c` → `dest/c`). Ignored without `only`.
+    pub flatten: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -417,6 +420,7 @@ fn rewrite(
     let all = ExtractOptions {
         only: None,
         overwrite: Overwrite::Replace,
+        ..Default::default()
     };
     let warnings = extract(path, root, &all, ctx)?;
     if let Some(w) = warnings.first() {

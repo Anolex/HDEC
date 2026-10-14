@@ -34,8 +34,15 @@ egui-phosphor = { version = "0.14.0", features = ["regular", "fill"] }
 winresource = "0.1.34"
 # macOS only: receive files opened from Finder (same versions rfd uses).
 objc2 = "0.6.5"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSNotification", "NSString", "NSURL"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder"] }
+# Also: dragging entries out as file promises.
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSError", "NSGeometry", "NSNotification", "NSOperation", "NSProcessInfo", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSApplication", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSFilePromiseProvider", "NSGraphics", "NSGraphicsContext", "NSImage", "NSPasteboard", "NSResponder", "NSView", "NSWindow", "NSWorkspace"] }
+block2 = "0.6.2"
+# Windows only: dragging entries out (shell data object, our IDropSource). Pure Rust.
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
+windows-core = "0.62.2"   # `#[implement]` expands to paths in it
+# The native window behind eframe's, for the OS drag (same version eframe uses).
+raw-window-handle = "0.6.2"
 
 # Compression crates are unusably slow unoptimized; keep our own code debuggable.
 [profile.dev.package."*"]

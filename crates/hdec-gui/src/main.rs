@@ -1,11 +1,16 @@
 // No console window behind the GUI on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod drag_out;
+#[cfg(target_os = "macos")]
+mod mac_drag;
 #[cfg(target_os = "macos")]
 mod mac_open;
 #[cfg_attr(target_os = "macos", allow(dead_code))] // macOS uses the native panel
 mod picker;
 mod theme;
+#[cfg(windows)]
+mod win_drag;
 
 use eframe::egui::{self, Align, Key, Layout, Margin, RichText, Sense, vec2};
 use egui_extras::{Column, TableBuilder};
@@ -90,6 +95,11 @@ enum Action {
         entry: String,
         dir: PathBuf,
     },
+    /// Extract one encrypted entry into `dir` to check the password.
+    Unlock {
+        entry: String,
+        dir: PathBuf,
+    },
 }
 
 enum Outcome {
@@ -99,7 +109,18 @@ enum Outcome {
     Created(PathBuf),
     Modified,
     Saved,
-    Previewed { entry: String, file: PathBuf },
+    Previewed {
+        entry: String,
+        file: PathBuf,
+    },
+    Unlocked,
+    /// Dragged out into `dest` (`None`: not known, Explorer copies it on).
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+    DraggedOut {
+        dest: Option<PathBuf>,
+        count: usize,
+        warnings: Vec<String>,
+    },
 }
 
 enum Msg {
@@ -225,8 +246,22 @@ enum Command {
     Move(Vec<String>, String),
 }
 
-/// Drag & drop payload: entry paths being moved inside the archive.
+/// Drag & drop payload: entry paths being moved inside the archive, or out
+/// of the window (`drag_out`).
 struct Dragged(Vec<String>);
+
+/// Jobs that start outside the UI thread (extracting dragged-out entries).
+struct JobQueue {
+    tx: mpsc::Sender<Job>,
+    rx: mpsc::Receiver<Job>,
+}
+
+impl Default for JobQueue {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self { tx, rx }
+    }
+}
 
 #[derive(Default)]
 struct App {
@@ -255,7 +290,13 @@ struct App {
     status: String,
     /// Where entries opened with the default app are extracted; removed on exit.
     preview_dir: Option<tempfile::TempDir>,
+    /// Where dragged-out entries are extracted (Windows); removed on exit.
+    drag_dir: Option<tempfile::TempDir>,
+    /// Numbers the subfolders of the two above.
     previews: u32,
+    drag_jobs: JobQueue,
+    /// An OS drag took over the mouse: egui never sees the button go up.
+    release_pointer: bool,
     /// Files opened with the default app, watched for edits to save back.
     opened: Vec<OpenedFile>,
     /// Why the open archive can't be edited, if it can't.
@@ -302,17 +343,14 @@ impl App {
             }
         }
         // Everything reads the working copy when there is one: that's what's on screen.
-        let archive = self
-            .working
-            .as_ref()
-            .map(|w| w.path.clone())
-            .or(self.archive.clone());
+        let archive = self.reading();
         let (verb, icon) = match &action {
             Action::Open(_) => ("Opening", icon::FOLDER_OPEN),
             Action::Extract(..) => ("Extracting", icon::EXPORT),
             Action::Test => ("Testing", icon::CHECK_CIRCLE),
             Action::Modify(_) => ("Updating", icon::PENCIL_SIMPLE),
             Action::Preview { .. } => ("Opening", icon::FILE),
+            Action::Unlock { .. } => ("Unlocking", icon::LOCK_SIMPLE),
         };
         let retry = Some(action.clone());
         self.spawn(ctx, verb, icon, retry, password, move |c| match action {
@@ -339,10 +377,20 @@ impl App {
                 let opts = ExtractOptions {
                     only: Some(vec![entry.clone()]),
                     overwrite: Overwrite::Replace,
+                    ..Default::default()
                 };
                 hdec_core::extract(archive.as_deref().unwrap(), &dir, &opts, c)?;
                 let file = hdec_core::safe_path::join(&dir, &entry)?;
                 Ok(Outcome::Previewed { entry, file })
+            }
+            Action::Unlock { entry, dir } => {
+                let opts = ExtractOptions {
+                    only: Some(vec![entry]),
+                    overwrite: Overwrite::Replace,
+                    ..Default::default()
+                };
+                hdec_core::extract(archive.as_deref().unwrap(), &dir, &opts, c)?;
+                Ok(Outcome::Unlocked)
             }
         });
     }
@@ -497,6 +545,24 @@ impl App {
                     self.dialog = Dialog::Error(format!("Couldn't open {}: {e}", file.display()))
                 }
             },
+            Outcome::Unlocked => self.status = "Unlocked. Drag the items out again.".into(),
+            Outcome::DraggedOut {
+                dest,
+                count,
+                warnings,
+            } => {
+                let items = if count == 1 { "item" } else { "items" };
+                self.status = match dest {
+                    Some(dest) => format!("Extracted {count} {items} to {}", dest.display()),
+                    None => format!("Extracted {count} {items}"),
+                };
+                if !warnings.is_empty() {
+                    self.dialog = Dialog::Info(format!(
+                        "Extracted with warnings:\n\n{}",
+                        warnings.join("\n")
+                    ));
+                }
+            }
         }
     }
 
@@ -795,24 +861,117 @@ impl App {
     }
 
     fn preview(&mut self, ctx: &egui::Context, entry: String) {
-        if self.preview_dir.is_none() {
-            match tempfile::Builder::new().prefix("hdec-open").tempdir() {
-                Ok(dir) => self.preview_dir = Some(dir),
+        // A fresh subfolder per open: the previous copy may still be open in another app.
+        let Some(dir) = self.temp_subdir(false) else {
+            return;
+        };
+        self.run(ctx, Action::Preview { entry, dir }, self.password.clone());
+    }
+
+    /// A new, not yet created folder in the preview (or drag) temp folder.
+    fn temp_subdir(&mut self, drag: bool) -> Option<PathBuf> {
+        let (slot, prefix) = if drag {
+            (&mut self.drag_dir, "hdec-drag")
+        } else {
+            (&mut self.preview_dir, "hdec-open")
+        };
+        if slot.is_none() {
+            match tempfile::Builder::new().prefix(prefix).tempdir() {
+                Ok(dir) => *slot = Some(dir),
                 Err(e) => {
                     self.dialog = Dialog::Error(format!("Couldn't create a temporary folder: {e}"));
-                    return;
+                    return None;
                 }
             }
         }
-        // A fresh subfolder per open: the previous copy may still be open in another app.
+        let base = slot.as_ref().unwrap().path().to_path_buf();
         self.previews += 1;
-        let dir = self
-            .preview_dir
+        Some(base.join(self.previews.to_string()))
+    }
+
+    /// An entry drag that leaves the window becomes an OS drag; the entries
+    /// are extracted where they are dropped.
+    fn drag_out(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if !drag_out::SUPPORTED {
+            return;
+        }
+        let Some(dragged) = egui::DragAndDrop::payload::<Dragged>(ctx) else {
+            return;
+        };
+        let window = ctx.content_rect();
+        let left = ctx.input(|i| {
+            i.pointer.primary_down() && i.pointer.latest_pos().is_none_or(|p| !window.contains(p))
+        });
+        if !left {
+            return;
+        }
+        egui::DragAndDrop::clear_payload(ctx);
+        ctx.stop_dragging();
+        self.release_pointer = true;
+        ctx.request_repaint();
+        if self.job.is_some() {
+            return;
+        }
+        let items: Vec<(String, bool)> = dragged
+            .0
+            .iter()
+            .map(|p| {
+                (
+                    p.clone(),
+                    self.rows.iter().any(|r| r.path == *p && r.is_dir),
+                )
+            })
+            .collect();
+        // Nothing can ask for it once they're dropped: ask now.
+        let inside = |path: &str| {
+            items.iter().any(|(p, _)| {
+                path.strip_prefix(p.as_str())
+                    .is_some_and(|r| r.is_empty() || r.starts_with('/'))
+            })
+        };
+        let locked = self
+            .entries
+            .iter()
+            .filter(|e| e.encrypted && !e.is_dir && inside(&e.path))
+            .min_by_key(|e| e.size)
+            .map(|e| e.path.clone());
+        if let (None, Some(entry)) = (&self.password, locked) {
+            if let Some(dir) = self.temp_subdir(false) {
+                self.dialog = Dialog::Password {
+                    input: Default::default(),
+                    then: Action::Unlock { entry, dir },
+                    wrong: false,
+                    show: false,
+                };
+            }
+            return;
+        }
+        let dir = if drag_out::NEEDS_DIR {
+            match self.temp_subdir(true) {
+                Some(dir) => dir,
+                None => return,
+            }
+        } else {
+            PathBuf::new()
+        };
+        let drag = drag_out::DragOut {
+            archive: self.reading().unwrap(),
+            items,
+            password: self.password.clone(),
+            jobs: self.drag_jobs.tx.clone(),
+            egui: ctx.clone(),
+        };
+        if let Err(e) = drag_out::start(frame, drag, &dir) {
+            self.dialog = Dialog::Error(format!("Couldn't drag the items out: {e}"));
+        }
+    }
+
+    /// What's on screen: the working copy if there is one, else the archive.
+    fn reading(&self) -> Option<PathBuf> {
+        self.working
             .as_ref()
-            .unwrap()
-            .path()
-            .join(self.previews.to_string());
-        self.run(ctx, Action::Preview { entry, dir }, self.password.clone());
+            .map(|w| w.path.clone())
+            .or(self.archive.clone())
     }
 
     fn start_rename(&mut self) {
@@ -948,7 +1107,7 @@ impl App {
             if root.clicked() {
                 self.navigate(String::new());
             }
-            if let Some(dragged) = drop_target(ui, &root) {
+            if let Some(dragged) = drop_target(ui, &root, self.modifiable) {
                 self.command(ui.ctx(), Command::Move(dragged, String::new()));
             }
             let mut path = String::new();
@@ -969,7 +1128,7 @@ impl App {
                 if response.clicked() {
                     self.navigate(path.clone());
                 }
-                if let Some(dragged) = drop_target(ui, &response) {
+                if let Some(dragged) = drop_target(ui, &response, self.modifiable) {
                     self.command(ui.ctx(), Command::Move(dragged, path.clone()));
                 }
             }
@@ -1059,7 +1218,7 @@ impl App {
             font,
             p.text,
         );
-        if let Some(dragged) = drop_target(ui, &resp) {
+        if let Some(dragged) = drop_target(ui, &resp, self.modifiable) {
             self.command(ui.ctx(), Command::Move(dragged, path.clone()));
         }
         if resp.clicked() {
@@ -1088,13 +1247,10 @@ impl App {
         let mut sort_by = None;
         let mut action = None;
         let (command, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
-        let sense = if self.modifiable {
-            Sense::click_and_drag()
-        } else {
-            Sense::click()
-        };
+        // Draggable either way: out of the window extracts.
+        let modifiable = self.modifiable;
         TableBuilder::new(ui)
-            .sense(sense)
+            .sense(Sense::click_and_drag())
             .cell_layout(Layout::left_to_right(Align::Center))
             .column(Column::remainder().at_least(120.0).clip(true))
             .column(Column::exact(70.0))
@@ -1218,7 +1374,7 @@ impl App {
                     });
 
                     let response = row.response();
-                    if self.modifiable && response.drag_started() {
+                    if response.drag_started() {
                         let paths = if self.selected.contains(&e.path) {
                             self.selected.iter().cloned().collect()
                         } else {
@@ -1226,7 +1382,7 @@ impl App {
                         };
                         response.dnd_set_drag_payload(Dragged(paths));
                     }
-                    if e.is_dir {
+                    if e.is_dir && modifiable {
                         if response.dnd_hover_payload::<Dragged>().is_some() {
                             let stroke = egui::Stroke::new(1.5, p.accent);
                             let painter = response.ctx.layer_painter(response.layer_id);
@@ -1802,7 +1958,14 @@ impl App {
                             .then(|| self.selected.iter().cloned().collect());
                         self.run(
                             ctx,
-                            Action::Extract(target, ExtractOptions { only, overwrite }),
+                            Action::Extract(
+                                target,
+                                ExtractOptions {
+                                    only,
+                                    overwrite,
+                                    ..Default::default()
+                                },
+                            ),
                             self.password.clone(),
                         );
                         Dialog::None
@@ -1892,15 +2055,35 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if std::mem::take(&mut self.release_pointer) {
+            raw_input.events.push(egui::Event::PointerButton {
+                pos: egui::pos2(-1.0, -1.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            });
+            raw_input.events.push(egui::Event::PointerGone);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let p = pal(&ctx);
+        if self.job.is_none()
+            && let Ok(job) = self.drag_jobs.rx.try_recv()
+        {
+            self.job = Some(job);
+        }
         self.poll_job(&ctx);
+        // Our own dragged-out files dropped back onto the window: nothing to do.
+        let drag_dir = self.drag_dir.as_ref().map(|d| d.path().to_path_buf());
         let dropped: Vec<PathBuf> = ui.input(|i| {
             i.raw
                 .dropped_files
                 .iter()
                 .map(|f| f.path().to_path_buf())
+                .filter(|p| drag_dir.as_ref().is_none_or(|d| !p.starts_with(d)))
                 .collect()
         });
         if !dropped.is_empty() && self.job.is_none() {
@@ -1980,9 +2163,10 @@ impl eframe::App for App {
                     self.empty_state(ui);
                 }
             });
+        self.drag_out(&ctx, frame);
         self.dialogs(&ctx);
         self.drop_overlay(&ctx);
-        drag_preview(&ctx);
+        drag_preview(&ctx, self.modifiable);
     }
 }
 
@@ -2262,7 +2446,10 @@ fn add_sources(sources: &mut Vec<PathBuf>, paths: Vec<PathBuf>) {
 }
 
 /// Accepts a dropped `Dragged` payload on `response`, highlighting it while hovered.
-fn drop_target(ui: &egui::Ui, response: &egui::Response) -> Option<Vec<String>> {
+fn drop_target(ui: &egui::Ui, response: &egui::Response, enabled: bool) -> Option<Vec<String>> {
+    if !enabled {
+        return None;
+    }
     if response.dnd_hover_payload::<Dragged>().is_some() {
         let stroke = egui::Stroke::new(1.5, pal(ui.ctx()).accent);
         ui.painter()
@@ -2273,8 +2460,9 @@ fn drop_target(ui: &egui::Ui, response: &egui::Response) -> Option<Vec<String>> 
         .map(|d| d.0.clone())
 }
 
-/// "Move N items" label following the pointer while entries are dragged.
-fn drag_preview(ctx: &egui::Context) {
+/// Label following the pointer while entries are dragged: a move inside
+/// the archive, or (read-only) only out of the window.
+fn drag_preview(ctx: &egui::Context, modifiable: bool) {
     let (Some(dragged), Some(pos)) = (
         egui::DragAndDrop::payload::<Dragged>(ctx),
         ctx.pointer_latest_pos(),
@@ -2282,9 +2470,14 @@ fn drag_preview(ctx: &egui::Context) {
         return;
     };
     let p = pal(ctx);
+    let glyph = if modifiable {
+        icon::ARROWS_OUT_CARDINAL
+    } else {
+        icon::EXPORT
+    };
     let text = match dragged.0.as_slice() {
-        [one] => format!("{}  {}", icon::ARROWS_OUT_CARDINAL, base_name(one)),
-        many => format!("{}  {} items", icon::ARROWS_OUT_CARDINAL, many.len()),
+        [one] => format!("{glyph}  {}", base_name(one)),
+        many => format!("{glyph}  {} items", many.len()),
     };
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Tooltip,

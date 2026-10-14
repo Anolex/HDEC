@@ -109,7 +109,7 @@ pub fn extract(
         decode_parallel(path, jobs.collect(), all_cores(), ctx, &meter)?;
         return Ok(Vec::new());
     };
-    let mut x = Extractor::new(dest, opts.overwrite, ctx)?;
+    let mut x = Extractor::new(dest, opts, ctx)?;
     let mut seen = HashSet::new();
     let distinct = items
         .iter()

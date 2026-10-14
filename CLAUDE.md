@@ -4,7 +4,7 @@ Cross-platform (macOS + Windows) GUI archiver in 100% Rust. Full plan, scope and
 
 ## Layout
 - `crates/hdec-core` — library: format detection, list/extract/test/create/modify. No GUI deps.
-- `crates/hdec-gui` — binary `hdec`, eframe/egui front end. `mac_open.rs`: files opened from Finder arrive as `application:openURLs:`, added to winit's app delegate (winit sets its own; never replace it). Talks to core only through its public API. `theme.rs` holds colors, fonts (Phosphor icons) and custom widgets; the design reference is `docs/ui-mockup.html`. After UI changes, render the screenshots and look at them.
+- `crates/hdec-gui` — binary `hdec`, eframe/egui front end. `mac_open.rs`: files opened from Finder arrive as `application:openURLs:`, added to winit's app delegate (winit sets its own; never replace it). Talks to core only through its public API. `drag_out.rs`: an entry drag leaving the window becomes a native OS drag (`mac_drag.rs` file promises, `win_drag.rs` placeholders + `IDropSource`), extracted on drop with `ExtractOptions::flatten`. `theme.rs` holds colors, fonts (Phosphor icons) and custom widgets; the design reference is `docs/ui-mockup.html`. After UI changes, render the screenshots and look at them.
 - Formats live in `crates/hdec-core/src/formats/<format>.rs`; dispatch is a `match Format` in `lib.rs`.
 
 ## Commands
