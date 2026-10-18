@@ -11,6 +11,7 @@ use hdec_core::{Ctx, ExtractOptions, Overwrite};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
+use std::time::Instant;
 
 /// What's being dragged out. The OS calls `extract` once there is a
 /// destination, possibly from another thread.
@@ -35,6 +36,8 @@ impl DragOut {
             progress: (0, 0, String::new()),
             verb: "Extracting",
             icon: icon::EXPORT,
+            subject: crate::file_name(&self.archive),
+            started: Instant::now(),
             retry: None,
             password: None,
         });

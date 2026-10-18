@@ -237,10 +237,12 @@ pub fn pill(ui: &mut Ui, text: &str) {
 }
 
 /// Thin progress bar; `None` = indeterminate (animated).
-pub fn progress_bar(ui: &mut Ui, fraction: Option<f32>, width: f32) {
+/// Without a fraction, a segment sweeps across: busy, amount unknown.
+pub fn progress_bar(ui: &mut Ui, fraction: Option<f32>, width: f32, height: f32) {
     let p = pal(ui.ctx());
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 6.0), Sense::hover());
-    ui.painter().rect_filled(rect, 3.0, p.border);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    let radius = height / 2.0;
+    ui.painter().rect_filled(rect, radius, p.border);
     let span = match fraction {
         Some(f) => (0.0, f.clamp(0.0, 1.0)),
         None => {
@@ -252,7 +254,7 @@ pub fn progress_bar(ui: &mut Ui, fraction: Option<f32>, width: f32) {
     let mut bar = rect;
     bar.min.x = rect.left() + rect.width() * span.0;
     bar.max.x = rect.left() + rect.width() * span.1;
-    ui.painter().rect_filled(bar, 3.0, p.accent);
+    ui.painter().rect_filled(bar, radius, p.accent);
 }
 
 pub fn dashed_rect(ui: &Ui, rect: egui::Rect, color: Color32) {
