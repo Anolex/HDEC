@@ -188,6 +188,36 @@ pub struct ExtractOptions {
     /// Each `only` item lands in `dest` under its own name, without the
     /// archive folders above it (`a/b/c` → `dest/c`). Ignored without `only`.
     pub flatten: bool,
+    /// Told each extracted file's path once it is complete, checked and in
+    /// place, so it can be used before the rest is done. Called from writer
+    /// threads; not for folders and links.
+    pub on_file: Option<OnFile>,
+}
+
+/// Where entry `name` lands when `only` is extracted flattened
+/// (`ExtractOptions::flatten`): below the folder holding its outermost
+/// selected item. `None` = not selected.
+pub fn flattened<'n>(only: &[String], name: &'n str) -> Option<&'n str> {
+    let trimmed = name.trim_end_matches('/');
+    only.iter()
+        .filter(|s| {
+            trimmed
+                .strip_prefix(s.as_str())
+                .is_some_and(|r| r.is_empty() || r.starts_with('/'))
+        })
+        .map(|s| s.rfind('/').map_or(0, |i| i + 1))
+        .min()
+        .map(|skip| &name[skip..])
+}
+
+/// See `ExtractOptions::on_file`.
+#[derive(Clone)]
+pub struct OnFile(pub Arc<dyn Fn(&Path) + Send + Sync>);
+
+impl fmt::Debug for OnFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OnFile")
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use theme::{icon, pal};
 use zeroize::Zeroizing;
 
@@ -134,6 +134,9 @@ struct Job {
     progress: (u64, u64, String),
     verb: &'static str,
     icon: &'static str,
+    /// What it's working on, shown under the verb: an archive's file name.
+    subject: String,
+    started: Instant,
     /// What to retry with a password if this job reports one is needed.
     retry: Option<Action>,
     password: Password,
@@ -145,6 +148,8 @@ enum Dialog {
     None,
     Info(String),
     Error(String),
+    /// Explorer is still copying dragged-out files; closing again quits.
+    StillCopying,
     ConfirmDelete(Vec<String>),
     Rename {
         from: String,
@@ -308,6 +313,8 @@ struct App {
     after_save: Option<Then>,
     /// The user chose to quit; let the close request through.
     closing: bool,
+    /// Told that quitting stops a drop target's copy; the next close quits.
+    warned_copying: bool,
 }
 
 struct OpenedFile {
@@ -428,6 +435,8 @@ impl App {
             progress: (0, 0, String::new()),
             verb,
             icon,
+            subject: self.archive.as_deref().map(file_name).unwrap_or_default(),
+            started: Instant::now(),
             retry,
             password,
         });
@@ -724,6 +733,7 @@ impl App {
 
     fn create(&mut self, ctx: &egui::Context, form: CreateForm) {
         let dest = form.dest();
+        let subject = file_name(&dest);
         let opts = CreateOptions {
             format: form.format,
             level: form.level,
@@ -747,6 +757,9 @@ impl App {
                 Ok(Outcome::Created(dest))
             },
         );
+        if let Some(job) = &mut self.job {
+            job.subject = subject;
+        }
     }
 
     fn add(&mut self, ctx: &egui::Context, sources: Vec<PathBuf>) {
@@ -912,22 +925,23 @@ impl App {
         if self.job.is_some() {
             return;
         }
+        let dirs: BTreeSet<&str> = self
+            .rows
+            .iter()
+            .filter(|r| r.is_dir)
+            .map(|r| r.path.as_str())
+            .collect();
         let items: Vec<(String, bool)> = dragged
             .0
             .iter()
-            .map(|p| {
-                (
-                    p.clone(),
-                    self.rows.iter().any(|r| r.path == *p && r.is_dir),
-                )
-            })
+            .map(|p| (p.clone(), dirs.contains(p.as_str())))
             .collect();
         // Nothing can ask for it once they're dropped: ask now.
+        let selected: BTreeSet<&str> = items.iter().map(|(p, _)| p.as_str()).collect();
         let inside = |path: &str| {
-            items.iter().any(|(p, _)| {
-                path.strip_prefix(p.as_str())
-                    .is_some_and(|r| r.is_empty() || r.starts_with('/'))
-            })
+            std::iter::once(path)
+                .chain(drag_out::parents(path))
+                .any(|p| selected.contains(p))
         };
         let locked = self
             .entries
@@ -954,10 +968,18 @@ impl App {
         } else {
             PathBuf::new()
         };
+        // Only Windows describes each file to the drop target.
+        let entries = if cfg!(windows) {
+            let entries = self.entries.iter().filter(|e| inside(&e.path));
+            entries.cloned().collect()
+        } else {
+            Vec::new()
+        };
         let drag = drag_out::DragOut {
             archive: self.reading().unwrap(),
             items,
             password: self.password.clone(),
+            entries,
             jobs: self.drag_jobs.tx.clone(),
             egui: ctx.clone(),
         };
@@ -1548,7 +1570,7 @@ impl App {
                 ui.label(RichText::new(job.icon).color(p.accent));
                 ui.label(RichText::new(job.verb).color(p.text));
                 let fraction = (*total > 0).then(|| *done as f32 / *total as f32);
-                theme::progress_bar(ui, fraction, 300.0);
+                theme::progress_bar(ui, fraction, 300.0, 6.0);
                 let pct = fraction
                     .map(|f| format!("{:.0}% · ", (f * 100.0).min(100.0)))
                     .unwrap_or_default();
@@ -1687,6 +1709,78 @@ impl App {
         }
     }
 
+    /// The running job, once it has taken long enough to be worth a window:
+    /// bar, current entry, bytes, speed, time left, Cancel.
+    fn progress_dialog(&mut self, ctx: &egui::Context) {
+        const AFTER: Duration = Duration::from_millis(400);
+        let Some(job) = &self.job else { return };
+        let elapsed = job.started.elapsed();
+        if elapsed < AFTER {
+            ctx.request_repaint_after(AFTER - elapsed);
+            return;
+        }
+        let p = pal(ctx);
+        let (done, total, name) = &job.progress;
+        let (done, total) = (*done, *total);
+        let fraction = (total > 0).then(|| (done as f32 / total as f32).min(1.0));
+        let secs = elapsed.as_secs_f64();
+        // Average since the start: steadier than the last few reports.
+        let rate = (secs >= 1.0 && done > 0).then(|| done as f64 / secs);
+        let cancelling = job.cancel.load(Ordering::Relaxed);
+        let cancel = job.cancel.clone();
+        theme::dialog_with(
+            ctx,
+            "progress",
+            420.0,
+            job.icon,
+            job.verb,
+            &job.subject,
+            |ui| {
+                ui.add_space(4.0);
+                theme::progress_bar(ui, fraction, ui.available_width(), 8.0);
+                ui.add_space(6.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let line = |ui: &mut egui::Ui, left: String, right: String| {
+                    egui::Sides::new().shrink_left().show(
+                        ui,
+                        |ui| {
+                            ui.add(egui::Label::new(RichText::new(left).color(p.muted)).truncate())
+                        },
+                        |ui| ui.label(RichText::new(right).color(p.muted)),
+                    );
+                };
+                let pct = fraction
+                    .map(|f| format!("{:.0}%", f * 100.0))
+                    .unwrap_or_default();
+                line(ui, name.clone(), pct);
+                let amount = if total > 0 {
+                    format!("{} of {}", human_size(done.min(total)), human_size(total))
+                } else {
+                    String::new()
+                };
+                let pace = match rate {
+                    _ if cancelling => "Cancelling…".to_owned(),
+                    Some(rate) if total > done => format!(
+                        "{}/s · about {} left",
+                        human_size(rate as u64),
+                        human_duration((total - done) as f64 / rate)
+                    ),
+                    Some(rate) => format!("{}/s", human_size(rate as u64)),
+                    None => String::new(),
+                };
+                line(ui, amount, pace);
+                theme::dialog_footer(ui, |ui| {
+                    let button = egui::Button::new("Cancel");
+                    if ui.add_enabled(!cancelling, button).clicked()
+                        || ui.input(|i| i.key_pressed(Key::Escape))
+                    {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                });
+            },
+        );
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context) {
         let p = pal(ctx);
         let archive_name = self
@@ -1704,7 +1798,18 @@ impl App {
             Dialog::Error(text) if message(ctx, icon::WARNING, "Something went wrong", &text) => {
                 Dialog::None
             }
-            open @ (Dialog::Info(_) | Dialog::Error(_)) => open,
+            Dialog::StillCopying
+                if message(
+                    ctx,
+                    icon::WARNING,
+                    "Still copying",
+                    "The files you dragged out are still being copied. Quitting now \
+                     stops that copy. Close the window again to quit anyway.",
+                ) =>
+            {
+                Dialog::None
+            }
+            open @ (Dialog::Info(_) | Dialog::Error(_) | Dialog::StillCopying) => open,
             Dialog::ConfirmDelete(names) => {
                 let subtitle = format!(
                     "{} item(s) will be removed from {archive_name}. This can't be undone.",
@@ -2111,9 +2216,18 @@ impl eframe::App for App {
         {
             self.open(&ctx, path);
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.dirty() && !self.closing {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.dialog = Dialog::Unsaved(Then::Close);
+        if !drag_out::copying() {
+            self.warned_copying = false;
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && !self.closing {
+            if self.dirty() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.dialog = Dialog::Unsaved(Then::Close);
+            } else if drag_out::copying() && !self.warned_copying {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.warned_copying = true;
+                self.dialog = Dialog::StillCopying;
+            }
         }
         self.shortcuts(&ctx);
         if !self.opened.is_empty() {
@@ -2165,6 +2279,7 @@ impl eframe::App for App {
             });
         self.drag_out(&ctx, frame);
         self.dialogs(&ctx);
+        self.progress_dialog(&ctx);
         self.drop_overlay(&ctx);
         drag_preview(&ctx, self.modifiable);
     }
@@ -2685,6 +2800,24 @@ fn archive_stem(path: &Path) -> String {
     }
 }
 
+/// A path's last component, for display.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// "12 s", "3 min", "1 h 5 min".
+fn human_duration(secs: f64) -> String {
+    let secs = secs.ceil() as u64;
+    match secs {
+        0..60 => format!("{secs} s"),
+        60..3600 => format!("{} min", secs.div_ceil(60)),
+        _ => format!("{} h {} min", secs / 3600, secs % 3600 / 60),
+    }
+}
+
 fn human_size(bytes: u64) -> String {
     let mut size = bytes as f64;
     for unit in ["B", "KB", "MB", "GB"] {
@@ -2952,7 +3085,7 @@ mod tests {
             app.navigate("tree/sub".into());
             app.selected.insert("tree/sub/b.txt".into());
         };
-        let states: [(&str, Setup); 12] = [
+        let states: [(&str, Setup); 13] = [
             ("saveback", |app, ctx, path, entries| {
                 app.finish(ctx, Outcome::Opened(path.to_path_buf(), entries.to_vec()));
                 app.dialog = Dialog::SaveBack {
@@ -2998,10 +3131,14 @@ mod tests {
                     show: false,
                 };
             }),
+            ("still_copying", |app, ctx, path, entries| {
+                app.finish(ctx, Outcome::Opened(path.to_path_buf(), entries.to_vec()));
+                app.dialog = Dialog::StillCopying;
+            }),
             ("progress", |app, ctx, path, entries| {
                 app.finish(ctx, Outcome::Opened(path.to_path_buf(), entries.to_vec()));
                 let (_tx, rx) = mpsc::channel();
-                let progress = (620, 1000, "tree/big.bin".into());
+                let progress = (650 << 20, 1000 << 20, "tree/big.bin".into());
                 let cancel = Arc::new(AtomicBool::new(false));
                 app.job = Some(Job {
                     rx,
@@ -3009,6 +3146,8 @@ mod tests {
                     progress,
                     verb: "Extracting",
                     icon: icon::EXPORT,
+                    subject: file_name(path),
+                    started: Instant::now() - Duration::from_secs(14),
                     retry: None,
                     password: None,
                 });
