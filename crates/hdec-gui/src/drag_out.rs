@@ -7,7 +7,7 @@
 
 use crate::{Job, Msg, Outcome, Password, icon};
 use eframe::egui;
-use hdec_core::{Ctx, Entry, ExtractOptions, OnFile, Overwrite};
+use hdec_core::{Ctx, Entry, ExtractOptions, OnFile, Overwrite, ProgressFn};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -32,22 +32,26 @@ impl DragOut {
     /// Extracts the items straight into `dest`, each under its own name,
     /// keeping anything already there. Blocks; shown in the UI as a job.
     pub fn extract(&self, dest: &Path, shown_dest: Option<PathBuf>) -> Result<(), String> {
-        self.extract_with(dest, shown_dest, Arc::new(AtomicBool::new(false)), None)
+        let cancel = Arc::new(AtomicBool::new(false));
+        let job = self.job(cancel.clone());
+        let progress = job.clone();
+        let result = self.run(
+            dest,
+            cancel,
+            Arc::new(move |done, total, name: &str| progress.progress(done, total, name)),
+            None,
+        );
+        let answer = result.as_ref().map(drop).map_err(ToString::to_string);
+        job.done(result.map(|warnings| self.outcome(shown_dest, warnings)));
+        answer
     }
 
-    /// `extract`, also stopped by `cancel`, telling `on_file` about each
-    /// finished file (`ExtractOptions::on_file`).
-    pub fn extract_with(
-        &self,
-        dest: &Path,
-        shown_dest: Option<PathBuf>,
-        cancel: Arc<AtomicBool>,
-        on_file: Option<OnFile>,
-    ) -> Result<(), String> {
+    /// Shows a job for this drag in the window; its Cancel sets `cancel`.
+    pub fn job(&self, cancel: Arc<AtomicBool>) -> JobHandle {
         let (tx, rx) = mpsc::channel();
         let _ = self.jobs.send(Job {
             rx,
-            cancel: cancel.clone(),
+            cancel,
             progress: (0, 0, String::new()),
             verb: "Extracting",
             icon: icon::EXPORT,
@@ -57,14 +61,25 @@ impl DragOut {
             password: None,
         });
         self.egui.request_repaint();
-        let (progress_tx, egui) = (tx.clone(), self.egui.clone());
+        JobHandle {
+            tx,
+            egui: self.egui.clone(),
+        }
+    }
+
+    /// Extracts the items flattened into `dest` (see `extract`), without a
+    /// job of its own. Returns the warnings.
+    pub fn run(
+        &self,
+        dest: &Path,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<ProgressFn>,
+        on_file: Option<OnFile>,
+    ) -> hdec_core::Result<Vec<String>> {
         let ctx = Ctx {
             password: self.password.as_deref().map(String::as_str),
             cancel,
-            progress: Arc::new(move |done, total, name: &str| {
-                let _ = progress_tx.send(Msg::Progress(done, total, name.to_owned()));
-                egui.request_repaint();
-            }),
+            progress,
         };
         let opts = ExtractOptions {
             only: Some(self.items.iter().map(|(p, _)| p.clone()).collect()),
@@ -72,15 +87,34 @@ impl DragOut {
             flatten: true,
             on_file,
         };
-        let result = hdec_core::extract(&self.archive, dest, &opts, &ctx);
-        let answer = result.as_ref().map(drop).map_err(ToString::to_string);
-        let _ = tx.send(Msg::Done(result.map(|warnings| Outcome::DraggedOut {
-            dest: shown_dest,
+        hdec_core::extract(&self.archive, dest, &opts, &ctx)
+    }
+
+    pub fn outcome(&self, dest: Option<PathBuf>, warnings: Vec<String>) -> Outcome {
+        Outcome::DraggedOut {
+            dest,
             count: self.items.len(),
             warnings,
-        })));
+        }
+    }
+}
+
+/// A job in the window, fed from any thread.
+#[derive(Clone)]
+pub struct JobHandle {
+    tx: mpsc::Sender<Msg>,
+    egui: egui::Context,
+}
+
+impl JobHandle {
+    pub fn progress(&self, done: u64, total: u64, name: &str) {
+        let _ = self.tx.send(Msg::Progress(done, total, name.to_owned()));
         self.egui.request_repaint();
-        answer
+    }
+
+    pub fn done(&self, result: hdec_core::Result<Outcome>) {
+        let _ = self.tx.send(Msg::Done(result));
+        self.egui.request_repaint();
     }
 }
 

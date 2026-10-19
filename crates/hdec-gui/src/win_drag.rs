@@ -2,39 +2,46 @@
 //! describes every file and folder (`FileGroupDescriptorW`) and hands out
 //! each file's contents as a stream (`FileContents`) once it's extracted.
 //! The data object supports asynchronous drops, so Explorer returns from the
-//! drop at once and reads the streams on its own thread, with its own copy
-//! progress, while our window keeps running and shows the extraction.
+//! drop at once and reads the streams on its own thread, while our window
+//! keeps running. Its job covers extraction and Explorer's reading, and ends
+//! when Explorer has everything (listing any file it didn't take).
 //!
-//! Extraction goes into a staging folder through the usual extractor; a
-//! stream request waits until its file there is reported complete and
-//! checked (`ExtractOptions::on_file`). The waiting happens on COM
-//! worker threads: the data object lives in the multithreaded apartment and
-//! the UI thread only holds a proxy to it, so calls from Explorer never
-//! reach the UI thread.
+//! Extraction goes into a staging folder through the usual extractor. A
+//! stream is handed out at once; reading it waits until its file is
+//! reported complete and checked (`ExtractOptions::on_file`). The waiting
+//! happens on COM worker threads: the data object and its streams live in
+//! the multithreaded apartment and the UI thread only holds a proxy, so
+//! calls from Explorer never reach the UI thread. The staging folder goes
+//! once Explorer has let go of all of it.
 //!
 //! A name too long for a descriptor (259 characters with its folders) falls
 //! back to placeholders: empty files that are swapped for the extracted
 //! entries when the button is released, blocking the window meanwhile.
 
-use crate::drag_out::{self, DragOut, VirtualFile};
+use crate::drag_out::{self, DragOut, JobHandle, VirtualFile};
 use hdec_core::OnFile;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::collections::HashSet;
+use std::ffi::c_void;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{
     DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_FORMATETC, DV_E_LINDEX,
-    DV_E_TYMED, E_ABORT, E_INVALIDARG, E_NOTIMPL, FILETIME, GlobalFree, HGLOBAL, HWND,
-    OLE_E_ADVISENOTSUPPORTED, POINT, S_OK, STG_E_FILENOTFOUND,
+    DV_E_TYMED, E_ABORT, E_FAIL, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, ERROR_CANCELLED, FILETIME,
+    GlobalFree, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, S_FALSE, S_OK, STG_E_ACCESSDENIED,
+    STG_E_FILENOTFOUND, STG_E_INVALIDFUNCTION, STG_E_INVALIDPOINTER, STG_E_MEDIUMFULL,
 };
 use windows::Win32::System::Com::{
-    COINIT_MULTITHREADED, CoIncrementMTAUsage, CoInitializeEx, CoUninitialize, DATADIR_GET,
-    FORMATETC, IAdviseSink, IBindCtx, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA,
-    STGM_READ, STGM_SHARE_DENY_NONE, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL, TYMED_ISTREAM,
+    COINIT_MULTITHREADED, CoIncrementMTAUsage, CoInitializeEx, CoTaskMemAlloc, CoUninitialize,
+    DATADIR_GET, FORMATETC, IAdviseSink, IBindCtx, IDataObject, IDataObject_Impl, IEnumFORMATETC,
+    IEnumSTATDATA, ISequentialStream_Impl, IStream, IStream_Impl, LOCKTYPE, STATFLAG,
+    STATFLAG_NONAME, STATSTG, STGC, STGM_READ, STGMEDIUM, STGMEDIUM_0, STGTY_STREAM, STREAM_SEEK,
+    STREAM_SEEK_CUR, STREAM_SEEK_END, STREAM_SEEK_SET, TYMED_HGLOBAL, TYMED_ISTREAM,
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{
@@ -50,15 +57,15 @@ use windows::Win32::UI::Shell::{
     BHID_DataObject, CFSTR_FILECONTENTS, CFSTR_FILEDESCRIPTORW, CFSTR_PREFERREDDROPEFFECT,
     FD_ATTRIBUTES, FD_FILESIZE, FD_PROGRESSUI, FD_UNICODE, FD_WRITESTIME, FILEDESCRIPTORW,
     IDataObjectAsyncCapability, IDataObjectAsyncCapability_Impl, ILFree,
-    SHCreateShellItemArrayFromIDLists, SHCreateStdEnumFmtEtc, SHCreateStreamOnFileEx, SHDoDragDrop,
-    SHParseDisplayName,
+    SHCreateShellItemArrayFromIDLists, SHCreateStdEnumFmtEtc, SHDoDragDrop, SHParseDisplayName,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GA_ROOT, GetAncestor, GetCursorPos, WindowFromPoint,
 };
-use windows_core::{AgileReference, BOOL, ComObject, HRESULT, HSTRING, Ref, implement};
+use windows_core::{AgileReference, BOOL, ComObject, HRESULT, HSTRING, PWSTR, Ref, implement};
 
-/// Data objects still held by a drop target, which may be reading from them.
+/// Drags whose staging is still in use: extracting, or a drop target may
+/// still be reading.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether a drop target may still be copying dragged-out files.
@@ -149,22 +156,10 @@ fn virtual_drag(
     dir: &Path,
     files: Vec<VirtualFile>,
 ) -> windows_core::Result<()> {
-    let staging = Arc::new(Staging {
-        descriptor: descriptor(&files),
-        served: files.iter().map(|f| AtomicBool::new(f.is_dir)).collect(),
-        files,
-        drag,
-        dir: dir.to_path_buf(),
-        cancel: Arc::new(AtomicBool::new(false)),
-        state: Mutex::new(State {
-            run: Run::Idle,
-            finished: HashSet::new(),
-        }),
-        changed: Condvar::new(),
-    });
+    let staging = Staging::new(drag, dir.to_path_buf(), files);
     let data = in_mta(DataObject::new(staging.clone()))?;
     // Released over a taker: start now, while the archive is as described,
-    // and so the extraction shows in the window right away.
+    // and so the job shows in the window right away.
     let source = Source::new(
         window,
         Some(Box::new(move || {
@@ -208,17 +203,20 @@ fn in_mta(data: DataObject) -> windows_core::Result<IDataObject> {
     agile.resolve()
 }
 
-/// The extraction behind one virtual-file drag.
+/// The extraction behind one virtual-file drag, and what the drop target
+/// has read of it. One job in the window covers both: it ends once the
+/// target has read everything, can't read any more, or the job is cancelled.
 struct Staging {
     drag: DragOut,
-    /// Fresh and ours: extraction goes here, Explorer copies from here.
+    /// Fresh and ours: extraction goes here, the target reads from here.
     dir: PathBuf,
     files: Vec<VirtualFile>,
     /// `FILEGROUPDESCRIPTORW` for `files`.
     descriptor: Vec<u8>,
-    /// Per file: its contents were handed out (folders count as served).
-    served: Vec<AtomicBool>,
+    /// What the target will read: the declared sizes.
+    total: u64,
     cancel: Arc<AtomicBool>,
+    job: OnceLock<JobHandle>,
     state: Mutex<State>,
     /// `state` changed.
     changed: Condvar,
@@ -228,82 +226,520 @@ struct State {
     run: Run,
     /// Files extracted completely so far.
     finished: HashSet<PathBuf>,
+    /// Per file: read to the end (folders count as read).
+    delivered: Vec<bool>,
+    /// Bytes the target has read.
+    read: u64,
+    /// Extraction progress: done, total.
+    extracted: (u64, u64),
+    /// The data object and live streams: what the target can still read through.
+    readers: usize,
+    /// The target said the drop is over (`EndOperation`).
+    ended: bool,
+    /// We cancelled extraction: nothing would read the rest.
+    stopped: bool,
+    /// Why the target's drop failed, if it did and wasn't cancelled.
+    failure: Option<String>,
+    reported: Option<Instant>,
 }
 
 enum Run {
     Idle,
     Running,
-    Done(Result<(), String>),
+    Done(hdec_core::Result<Vec<String>>),
+    /// The job has ended.
+    Settled,
 }
 
 impl Staging {
-    /// Starts extracting, once.
+    fn new(drag: DragOut, dir: PathBuf, files: Vec<VirtualFile>) -> Arc<Self> {
+        LIVE.fetch_add(1, Ordering::Relaxed);
+        let folders: Vec<bool> = files.iter().map(|f| f.is_dir).collect();
+        Arc::new(Self {
+            descriptor: descriptor(&files),
+            total: files.iter().filter_map(|f| f.size).sum(),
+            files,
+            drag,
+            dir,
+            cancel: Arc::new(AtomicBool::new(false)),
+            job: OnceLock::new(),
+            state: Mutex::new(State {
+                run: Run::Idle,
+                finished: HashSet::new(),
+                delivered: folders,
+                read: 0,
+                extracted: (0, 0),
+                readers: 0,
+                ended: false,
+                stopped: false,
+                failure: None,
+                reported: None,
+            }),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap()
+    }
+
+    /// Starts extracting, once. The thread stays until the job has ended.
     fn start(self: &Arc<Self>) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock();
         if !matches!(state.run, Run::Idle) {
             return;
         }
         state.run = Run::Running;
+        drop(state);
+        let _ = self.job.set(self.drag.job(self.cancel.clone()));
         let this = self.clone();
         std::thread::spawn(move || {
-            let notify = this.clone();
-            let on_file = OnFile(Arc::new(move |path: &Path| {
-                let mut state = notify.state.lock().unwrap();
-                state.finished.insert(path.to_path_buf());
-                notify.changed.notify_all();
-            }));
-            let result =
-                this.drag
-                    .extract_with(&this.dir, None, this.cancel.clone(), Some(on_file));
-            this.state.lock().unwrap().run = Run::Done(result);
+            let (progress, notify) = (this.clone(), this.clone());
+            let result = this.drag.run(
+                &this.dir,
+                this.cancel.clone(),
+                Arc::new(move |done, total, name: &str| {
+                    let mut state = progress.lock();
+                    state.extracted = (done, total);
+                    progress.report(&mut state, name);
+                }),
+                Some(OnFile(Arc::new(move |path: &Path| {
+                    notify.lock().finished.insert(path.to_path_buf());
+                    notify.changed.notify_all();
+                }))),
+            );
+            let mut state = this.lock();
+            state.run = Run::Done(result);
             this.changed.notify_all();
+            while !this.settle(&mut state) {
+                state = this
+                    .changed
+                    .wait_timeout(state, Duration::from_millis(200))
+                    .unwrap()
+                    .0;
+            }
         });
     }
 
-    /// Blocks until file `index` is extracted and checked.
-    fn wait_for(self: &Arc<Self>, index: usize) -> windows_core::Result<&Path> {
+    /// Ends the job once extraction is over and the target has read
+    /// everything, can't read more, or the job was cancelled. True once ended.
+    fn settle(&self, state: &mut State) -> bool {
+        if matches!(state.run, Run::Settled) {
+            return true;
+        }
+        let failed = match &state.run {
+            Run::Done(Err(e)) => !(state.stopped && matches!(e, hdec_core::Error::Cancelled)),
+            Run::Done(Ok(_)) => false,
+            _ => return false,
+        };
+        // By the user, here or in the target.
+        let cancelled = self.cancel.load(Ordering::Relaxed) && !state.stopped;
+        let all = state.delivered.iter().all(|d| *d);
+        if !(failed || all || cancelled || state.ended || state.readers == 0) {
+            return false;
+        }
+        let Run::Done(result) = std::mem::replace(&mut state.run, Run::Settled) else {
+            unreachable!("checked above")
+        };
+        self.changed.notify_all();
+        // Extracted but not read. What the extractor skipped is in its warnings.
+        let extracted = |f: &VirtualFile| state.finished.contains(&f.staged) || f.staged.is_file();
+        let missed: Vec<&str> = (self.files.iter().zip(&state.delivered))
+            .filter(|(f, delivered)| !**delivered && extracted(f))
+            .map(|(f, _)| f.name.as_str())
+            .collect();
+        let files = self.files.iter().filter(|f| !f.is_dir).count();
+        let taken = (self.files.iter().zip(&state.delivered))
+            .filter(|(f, delivered)| !f.is_dir && **delivered)
+            .count();
+        // Stopped by us: what was read is what the target took.
+        let result = match result {
+            Err(hdec_core::Error::Cancelled) if state.stopped => Ok(Vec::new()),
+            result => result,
+        };
+        let failure = state.failure.take();
+        let result = result.and_then(|mut warnings| {
+            if let Some(failure) = failure {
+                let error = format!("The drop target couldn't finish copying: {failure}");
+                return Err(hdec_core::Error::Io(std::io::Error::other(error)));
+            }
+            // Cancelled by the user, or the target took none of it.
+            if !missed.is_empty() && (cancelled || taken == 0) {
+                return Err(hdec_core::Error::Cancelled);
+            }
+            if !missed.is_empty() {
+                let more = missed.len().saturating_sub(10);
+                let mut list = missed[..missed.len() - more].join("\n");
+                if more > 0 {
+                    list.push_str(&format!("\n…and {more} more"));
+                }
+                warnings.push(format!(
+                    "{} of {files} files were not copied by the drop target:\n{list}",
+                    missed.len()
+                ));
+            }
+            Ok(self.drag.outcome(None, warnings))
+        });
+        if let Some(job) = self.job.get() {
+            job.done(result);
+        }
+        true
+    }
+
+    /// Shows extraction and reading as one bar: each counts half.
+    fn report(&self, state: &mut State, name: &str) {
+        let Some(job) = self.job.get() else { return };
+        let now = Instant::now();
+        if state
+            .reported
+            .is_some_and(|t| now - t < Duration::from_millis(100))
+        {
+            return;
+        }
+        state.reported = Some(now);
+        let (done, total) = state.extracted;
+        let size = if self.total > 0 { self.total } else { total };
+        let extracted = if total > 0 {
+            (done.min(total) as f64 / total as f64 * size as f64) as u64
+        } else {
+            0
+        };
+        job.progress((extracted + state.read.min(size)) / 2, size, name);
+    }
+
+    /// Blocks until file `index` is extracted and checked; returns its path.
+    fn wait_for(self: &Arc<Self>, index: usize) -> windows_core::Result<PathBuf> {
         self.start();
         let file = &self.files[index];
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock();
         loop {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(E_ABORT.into());
+            }
             if state.finished.contains(&file.staged) {
-                return Ok(&file.staged);
+                return Ok(file.staged.clone());
             }
             match &state.run {
                 // Hard links are made last, and not reported.
-                Run::Done(Ok(())) if file.staged.is_file() => return Ok(&file.staged),
+                Run::Done(Ok(_)) if file.staged.is_file() => return Ok(file.staged.clone()),
                 // Skipped (see the job's warnings).
-                Run::Done(Ok(())) => return Err(STG_E_FILENOTFOUND.into()),
+                Run::Done(Ok(_)) => return Err(STG_E_FILENOTFOUND.into()),
                 // Reported by the job.
-                Run::Done(Err(_)) => return Err(E_ABORT.into()),
-                _ => state = self.changed.wait(state).unwrap(),
+                Run::Done(Err(_)) | Run::Settled => return Err(E_ABORT.into()),
+                // Timed, to notice a cancel.
+                Run::Idle | Run::Running => {
+                    state = self
+                        .changed
+                        .wait_timeout(state, Duration::from_millis(200))
+                        .unwrap()
+                        .0;
+                }
             }
         }
     }
 
-    /// Nobody will read the rest: stop extracting it.
-    fn abandon(&self) {
-        if matches!(self.state.lock().unwrap().run, Run::Running) {
+    fn reader_added(&self) {
+        self.lock().readers += 1;
+    }
+
+    /// Nothing left to read through.
+    fn reader_gone(&self) {
+        let mut state = self.lock();
+        state.readers -= 1;
+        if state.readers == 0 {
+            self.stop(&mut state);
+        }
+        self.changed.notify_all();
+    }
+
+    /// The target is done with the drop, with `result`.
+    fn ended(&self, result: HRESULT) {
+        let mut state = self.lock();
+        state.ended = true;
+        let cancelled = [E_ABORT, HRESULT::from_win32(ERROR_CANCELLED.0)];
+        if cancelled.contains(&result) {
+            self.cancel.store(true, Ordering::Relaxed);
+        } else {
+            if result.is_err() {
+                state.failure = Some(windows_core::Error::from(result).message());
+            }
+            self.stop(&mut state);
+        }
+        self.changed.notify_all();
+    }
+
+    /// Nothing will read what's still being extracted: stop extracting.
+    fn stop(&self, state: &mut State) {
+        let busy = matches!(state.run, Run::Running) && !self.cancel.load(Ordering::Relaxed);
+        if busy && !state.delivered.iter().all(|d| *d) {
+            state.stopped = true;
             self.cancel.store(true, Ordering::Relaxed);
         }
     }
 
-    /// The data object is gone. Unless everything was handed out, the rest
-    /// is stopped; once extraction is over the staging folder goes.
-    fn released(self: &Arc<Self>) {
-        if !self.served.iter().all(|s| s.load(Ordering::Relaxed)) {
-            self.abandon();
+    /// The target read `bytes` of file `index`, up to its end if `at_end`.
+    fn read(&self, index: usize, bytes: u64, at_end: bool) {
+        let mut state = self.lock();
+        state.read += bytes;
+        if at_end && !state.delivered[index] {
+            state.delivered[index] = true;
+            self.changed.notify_all();
         }
-        let this = self.clone();
-        std::thread::spawn(move || {
-            let mut state = this.state.lock().unwrap();
-            while matches!(state.run, Run::Running) {
-                state = this.changed.wait(state).unwrap();
+        let name = &self.files[index].name;
+        self.report(&mut state, name);
+    }
+}
+
+impl Drop for Staging {
+    /// Nothing refers to the folder any more: the job has ended and the
+    /// target let go of everything.
+    fn drop(&mut self) {
+        LIVE.fetch_sub(1, Ordering::Relaxed);
+        let dir = std::mem::take(&mut self.dir);
+        std::thread::spawn(move || fs::remove_dir_all(dir));
+    }
+}
+
+/// One file's contents for the drop target. Reads wait for the file to be
+/// extracted, on COM worker threads (the stream lives in the MTA too).
+#[implement(IStream)]
+struct Stream {
+    /// Once extracted: the file and its length. Closed before `staging`
+    /// goes, which may remove the folder.
+    file: Mutex<Option<(fs::File, u64)>>,
+    staging: Arc<Staging>,
+    index: usize,
+}
+
+impl Stream {
+    fn new(staging: Arc<Staging>, index: usize) -> Self {
+        staging.reader_added();
+        Self {
+            staging,
+            index,
+            file: Mutex::new(None),
+        }
+    }
+
+    /// The file, waiting for it first if need be.
+    fn opened(&self) -> windows_core::Result<MutexGuard<'_, Option<(fs::File, u64)>>> {
+        let mut file = self.file.lock().unwrap();
+        if file.is_none() {
+            let path = self.staging.wait_for(self.index)?;
+            let opened = fs::File::open(&path).map_err(io_error)?;
+            let len = opened.metadata().map_err(io_error)?.len();
+            *file = Some((opened, len));
+        }
+        Ok(file)
+    }
+
+    /// Reads up to `buf.len()` bytes, fewer only at the end.
+    fn fill(&self, file: &mut fs::File, len: u64, buf: &mut [u8]) -> windows_core::Result<usize> {
+        let mut n = 0;
+        while n < buf.len() {
+            if self.staging.cancel.load(Ordering::Relaxed) {
+                return Err(E_ABORT.into());
             }
-            drop(state);
-            // Fails while a stream is still open; the app's temp folder goes on quit.
-            let _ = fs::remove_dir_all(&this.dir);
-        });
+            match file.read(&mut buf[n..]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(io_error(e)),
+            }
+        }
+        let at_end = file.stream_position().map_or(true, |p| p >= len);
+        self.staging.read(self.index, n as u64, at_end);
+        Ok(n)
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        // An empty file needs no reading: taken once asked for.
+        let empty = match self.file.get_mut().unwrap() {
+            Some((_, len)) => *len == 0,
+            None => {
+                let staged = &self.staging.files[self.index].staged;
+                let finished = self.staging.lock().finished.contains(staged);
+                finished && fs::metadata(staged).is_ok_and(|m| m.len() == 0)
+            }
+        };
+        if empty {
+            self.staging.read(self.index, 0, true);
+        }
+        self.staging.reader_gone();
+    }
+}
+
+impl ISequentialStream_Impl for Stream_Impl {
+    fn Read(&self, pv: *mut c_void, cb: u32, pcbread: *mut u32) -> HRESULT {
+        if pv.is_null() && cb > 0 {
+            return STG_E_INVALIDPOINTER;
+        }
+        let read = (|| {
+            let mut guard = self.opened()?;
+            let (file, len) = guard.as_mut().expect("opened");
+            if cb == 0 {
+                return Ok(0);
+            }
+            // SAFETY: COM hands us a buffer of `cb` bytes.
+            let buf = unsafe { std::slice::from_raw_parts_mut(pv.cast::<u8>(), cb as usize) };
+            self.fill(file, *len, buf)
+        })();
+        match read {
+            Ok(n) => {
+                if !pcbread.is_null() {
+                    // SAFETY: an out-pointer from COM.
+                    unsafe { *pcbread = n as u32 };
+                }
+                if n < cb as usize { S_FALSE } else { S_OK }
+            }
+            Err(e) => e.code(),
+        }
+    }
+
+    fn Write(&self, _: *const c_void, _: u32, _: *mut u32) -> HRESULT {
+        STG_E_ACCESSDENIED
+    }
+}
+
+impl IStream_Impl for Stream_Impl {
+    fn Seek(
+        &self,
+        offset: i64,
+        origin: STREAM_SEEK,
+        position: *mut u64,
+    ) -> windows_core::Result<()> {
+        let mut guard = self.opened()?;
+        let (file, _) = guard.as_mut().expect("opened");
+        let to = match origin {
+            STREAM_SEEK_SET => {
+                SeekFrom::Start(u64::try_from(offset).map_err(|_| STG_E_INVALIDFUNCTION)?)
+            }
+            STREAM_SEEK_CUR => SeekFrom::Current(offset),
+            STREAM_SEEK_END => SeekFrom::End(offset),
+            _ => return Err(STG_E_INVALIDFUNCTION.into()),
+        };
+        let at = file.seek(to).map_err(io_error)?;
+        if !position.is_null() {
+            // SAFETY: an out-pointer from COM.
+            unsafe { *position = at };
+        }
+        Ok(())
+    }
+
+    fn SetSize(&self, _: u64) -> windows_core::Result<()> {
+        Err(STG_E_ACCESSDENIED.into())
+    }
+
+    fn CopyTo(
+        &self,
+        target: Ref<IStream>,
+        cb: u64,
+        pcbread: *mut u64,
+        pcbwritten: *mut u64,
+    ) -> windows_core::Result<()> {
+        let target = target.ok()?;
+        let mut guard = self.opened()?;
+        let (file, len) = guard.as_mut().expect("opened");
+        let mut buf = vec![0; 256 << 10];
+        let (mut read, mut written) = (0u64, 0u64);
+        while read < cb {
+            let want = (cb - read).min(buf.len() as u64) as usize;
+            let n = self.fill(file, *len, &mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            read += n as u64;
+            let mut wrote = 0;
+            // SAFETY: `n` initialized bytes of `buf`.
+            unsafe { target.Write(buf.as_ptr().cast(), n as u32, Some(&mut wrote)) }.ok()?;
+            written += u64::from(wrote);
+            if wrote as usize != n {
+                return Err(STG_E_MEDIUMFULL.into());
+            }
+        }
+        // SAFETY: out-pointers from COM (or null).
+        unsafe {
+            if !pcbread.is_null() {
+                *pcbread = read;
+            }
+            if !pcbwritten.is_null() {
+                *pcbwritten = written;
+            }
+        }
+        Ok(())
+    }
+
+    fn Commit(&self, _: &STGC) -> windows_core::Result<()> {
+        Ok(())
+    }
+
+    fn Revert(&self) -> windows_core::Result<()> {
+        Ok(())
+    }
+
+    fn LockRegion(&self, _: u64, _: u64, _: &LOCKTYPE) -> windows_core::Result<()> {
+        Err(STG_E_INVALIDFUNCTION.into())
+    }
+
+    fn UnlockRegion(&self, _: u64, _: u64, _: u32) -> windows_core::Result<()> {
+        Err(STG_E_INVALIDFUNCTION.into())
+    }
+
+    fn Stat(&self, stat: *mut STATSTG, flags: &STATFLAG) -> windows_core::Result<()> {
+        if stat.is_null() {
+            return Err(STG_E_INVALIDPOINTER.into());
+        }
+        let file = &self.staging.files[self.index];
+        // A declared size needs no waiting.
+        let size = match file.size {
+            Some(size) => size,
+            None => self.opened()?.as_ref().expect("opened").1,
+        };
+        let name = if flags.0 & STATFLAG_NONAME.0 != 0 {
+            PWSTR::null()
+        } else {
+            let base = file.name.rsplit('\\').next().unwrap_or(&file.name);
+            co_string(base)?
+        };
+        // SAFETY: COM's out-pointer, checked above.
+        unsafe {
+            *stat = STATSTG {
+                pwcsName: name,
+                r#type: STGTY_STREAM.0 as u32,
+                cbSize: size,
+                mtime: file.modified.and_then(filetime).unwrap_or_default(),
+                grfMode: STGM_READ,
+                ..Default::default()
+            };
+        }
+        Ok(())
+    }
+
+    fn Clone(&self) -> windows_core::Result<IStream> {
+        Err(E_NOTIMPL.into())
+    }
+}
+
+/// A string the caller frees with `CoTaskMemFree`.
+fn co_string(s: &str) -> windows_core::Result<PWSTR> {
+    let wide: Vec<u16> = s.encode_utf16().chain([0]).collect();
+    // SAFETY: a fresh allocation of the right size, filled before use.
+    unsafe {
+        let at = CoTaskMemAlloc(wide.len() * 2).cast::<u16>();
+        if at.is_null() {
+            return Err(E_OUTOFMEMORY.into());
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), at, wide.len());
+        Ok(PWSTR(at))
+    }
+}
+
+fn io_error(e: std::io::Error) -> windows_core::Error {
+    match e.raw_os_error() {
+        Some(code) => HRESULT::from_win32(code as u32).into(),
+        None => E_FAIL.into(),
     }
 }
 
@@ -338,7 +774,7 @@ struct DataObject {
 
 impl DataObject {
     fn new(staging: Arc<Staging>) -> Self {
-        LIVE.fetch_add(1, Ordering::Relaxed);
+        staging.reader_added();
         Self {
             staging,
             formats: Formats::get(),
@@ -350,8 +786,7 @@ impl DataObject {
 
 impl Drop for DataObject {
     fn drop(&mut self) {
-        LIVE.fetch_sub(1, Ordering::Relaxed);
-        self.staging.released();
+        self.staging.reader_gone();
     }
 }
 
@@ -390,18 +825,8 @@ impl DataObject {
             .ok()
             .filter(|&i| self.staging.files.get(i).is_some_and(|f| !f.is_dir))
             .ok_or(windows_core::Error::from(DV_E_LINDEX))?;
-        let path = self.staging.wait_for(index)?;
-        // SAFETY: a valid path; the stream only reads.
-        let stream = unsafe {
-            SHCreateStreamOnFileEx(
-                &HSTRING::from(path),
-                (STGM_READ | STGM_SHARE_DENY_NONE).0,
-                0,
-                false,
-                None,
-            )?
-        };
-        self.staging.served[index].store(true, Ordering::Relaxed);
+        // Answered at once: reading it waits for the file instead.
+        let stream: IStream = Stream::new(self.staging.clone(), index).into();
         Ok(STGMEDIUM {
             tymed: TYMED_ISTREAM.0 as u32,
             u: STGMEDIUM_0 {
@@ -539,7 +964,6 @@ impl IDataObjectAsyncCapability_Impl for DataObject_Impl {
 
     fn StartOperation(&self, _: Ref<IBindCtx>) -> windows_core::Result<()> {
         self.in_operation.store(true, Ordering::Relaxed);
-        // It's coming: no need to wait for the first stream request.
         self.staging.start();
         Ok(())
     }
@@ -550,10 +974,7 @@ impl IDataObjectAsyncCapability_Impl for DataObject_Impl {
 
     fn EndOperation(&self, result: HRESULT, _: Ref<IBindCtx>, _: u32) -> windows_core::Result<()> {
         self.in_operation.store(false, Ordering::Relaxed);
-        // Cancelled or failed in Explorer: what's left is not needed.
-        if result.is_err() {
-            self.staging.abandon();
-        }
+        self.staging.ended(result);
         Ok(())
     }
 }
