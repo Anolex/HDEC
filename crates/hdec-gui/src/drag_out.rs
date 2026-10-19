@@ -141,3 +141,66 @@ pub const NEEDS_DIR: bool = cfg!(windows);
 
 /// Whether entries can be dragged out of the window here.
 pub const SUPPORTED: bool = cfg!(any(target_os = "macos", windows));
+
+/// `FILE_NOTIFY_INFORMATION` records: action and path below the watched folder.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn notify_records(bytes: &[u8]) -> Vec<(u32, String)> {
+    let u32_at = |at: usize| {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let (Some(next), Some(action), Some(len)) = (u32_at(at), u32_at(at + 4), u32_at(at + 8)) {
+        let Some(name) = bytes.get(at + 12..at + 12 + len as usize) else {
+            break;
+        };
+        let units: Vec<u16> = name
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        out.push((action, String::from_utf16_lossy(&units)));
+        if next == 0 {
+            break;
+        }
+        at += next as usize;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(next: u32, action: u32, name: &str) -> Vec<u8> {
+        let units: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut out = Vec::new();
+        out.extend(next.to_le_bytes());
+        out.extend(action.to_le_bytes());
+        out.extend((units.len() as u32).to_le_bytes());
+        out.extend(units);
+        out
+    }
+
+    #[test]
+    fn notify_records_are_read_in_order() {
+        let mut first = record(0, 1, "Users\\me\\Desktop\\HDEC drop 1");
+        // Records start DWORD-aligned.
+        first.resize(first.len().next_multiple_of(4), 0);
+        let next = first.len() as u32;
+        first[..4].copy_from_slice(&next.to_le_bytes());
+        let mut bytes = first;
+        bytes.extend(record(0, 5, "ünï"));
+        assert_eq!(
+            notify_records(&bytes),
+            [
+                (1, "Users\\me\\Desktop\\HDEC drop 1".to_owned()),
+                (5, "ünï".to_owned())
+            ]
+        );
+        // Cut short: what's whole is kept.
+        assert_eq!(notify_records(&bytes[..bytes.len() - 1]).len(), 1);
+        assert!(notify_records(&[]).is_empty());
+    }
+}

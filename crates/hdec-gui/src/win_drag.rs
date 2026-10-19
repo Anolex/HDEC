@@ -16,14 +16,23 @@ use std::ffi::OsString;
 use std::fs;
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
-    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, E_ABORT, HANDLE, HWND,
-    LPARAM, LRESULT, POINT, S_OK, WPARAM,
+    CloseHandle, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, E_ABORT, HANDLE,
+    HWND, LPARAM, LRESULT, POINT, S_OK, WAIT_TIMEOUT, WPARAM,
+};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ACTION_ADDED, FILE_ACTION_RENAMED_NEW_NAME, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW, GetLogicalDrives, OPEN_EXISTING,
+    ReadDirectoryChangesW,
 };
 use windows::Win32::System::Com::{IBindCtx, IDataObject};
+use windows::Win32::System::IO::{
+    CancelIoEx, GetOverlappedResult, GetOverlappedResultEx, OVERLAPPED,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::{
     DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE, IDropSource, IDropSource_Impl, OleInitialize,
@@ -104,7 +113,8 @@ fn drag_marker(
         )
     };
     let dropped = result.is_ok() && source.dropped.load(Ordering::Relaxed);
-    watch.next(dropped.then_some(drag));
+    let effect = result.as_ref().map_or(0, |e| e.0);
+    watch.next(dropped.then_some((drag, effect)));
     result.map(drop)
 }
 
@@ -150,8 +160,9 @@ impl IDropSource_Impl for Source_Impl {
     }
 }
 
-/// What to extract once the drag is over; `None` = not dropped.
-type Next = Option<DragOut>;
+/// What to extract once the drag is over, and the drop effect the target
+/// reported; `None` = not dropped.
+type Next = Option<(DragOut, u32)>;
 
 /// A hidden window on its own thread, told about new folders anywhere.
 struct Watch {
@@ -179,17 +190,52 @@ impl Watch {
     }
 }
 
-/// What the watch window's procedure knows (it runs on the watch thread).
-struct Watching {
+/// What both watchers share: the shell's notices (to the watch window) and
+/// each drive's own change journal (`watch_drive`).
+struct Seen {
     /// The marker's name.
     name: OsString,
-    /// Our own copy, in the temporary folder.
+    /// Our own copy, canonical: the shell reports long names, while %TEMP%
+    /// may be in 8.3 form.
     marker: PathBuf,
-    found: Option<PathBuf>,
+    found: Mutex<Option<PathBuf>>,
+    /// The watch window, woken when the marker turns up.
+    window: AtomicIsize,
+    /// For the error message, should the marker never turn up.
+    notices: AtomicUsize,
+    drives: AtomicUsize,
+    stop: AtomicBool,
+}
+
+impl Seen {
+    /// Takes `path` as the dropped marker if it is one, or if it is a folder
+    /// now holding it (a folder-changed notice instead of a new-folder one).
+    fn check(&self, path: &Path) {
+        let candidate = if path.file_name() == Some(self.name.as_os_str()) {
+            path.to_path_buf()
+        } else {
+            path.join(&self.name)
+        };
+        if !candidate.is_dir() || fs::canonicalize(&candidate).is_ok_and(|c| c == self.marker) {
+            return;
+        }
+        let mut found = self.found.lock().unwrap();
+        if found.is_none() {
+            *found = Some(candidate);
+            let window = HWND(self.window.load(Ordering::Relaxed) as *mut _);
+            // SAFETY: posting to our watch window; if it's gone, nothing happens.
+            let _ = unsafe { PostMessageW(Some(window), WM_FOUND, WPARAM(0), LPARAM(0)) };
+        }
+    }
+
+    fn found(&self) -> Option<PathBuf> {
+        self.found.lock().unwrap().clone()
+    }
 }
 
 thread_local! {
-    static WATCHING: RefCell<Option<Watching>> = const { RefCell::new(None) };
+    /// For the watch window's procedure, which runs on the watch thread.
+    static SEEN: RefCell<Option<Arc<Seen>>> = const { RefCell::new(None) };
 }
 
 /// The watch thread: reports its window through `ready`, waits for the end
@@ -202,14 +248,16 @@ fn watch(
     next: &mpsc::Receiver<Next>,
 ) {
     let temp = marker.parent().map(Path::to_path_buf);
-    WATCHING.with_borrow_mut(|w| {
-        *w = Some(Watching {
-            name,
-            // The shell reports long names; %TEMP% may be in 8.3 form.
-            marker: fs::canonicalize(&marker).unwrap_or(marker),
-            found: None,
-        })
+    let seen = Arc::new(Seen {
+        name,
+        marker: fs::canonicalize(&marker).unwrap_or(marker),
+        found: Mutex::new(None),
+        window: AtomicIsize::new(0),
+        notices: AtomicUsize::new(0),
+        drives: AtomicUsize::new(0),
+        stop: AtomicBool::new(false),
     });
+    SEEN.with_borrow_mut(|s| *s = Some(seen.clone()));
     let listener = match listen() {
         Ok(listener) => listener,
         Err(e) => {
@@ -217,8 +265,10 @@ fn watch(
             return;
         }
     };
-    let _ = ready.send(Ok(listener.0.0 as isize));
-    let found = || WATCHING.with_borrow(|w| w.as_ref().and_then(|w| w.found.clone()));
+    let window = listener.0.0 as isize;
+    seen.window.store(window, Ordering::Relaxed);
+    let drives = watch_drives(&seen);
+    let _ = ready.send(Ok(window));
     let cancel = Arc::new(AtomicBool::new(false));
     let mut then = None;
     let mut msg = MSG::default();
@@ -226,10 +276,10 @@ fn watch(
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
         match msg.message {
             WM_NEXT => match next.try_recv() {
-                Ok(Some(drag)) => {
+                Ok(Some((drag, effect))) => {
                     let job = drag.job(cancel.clone());
                     job.progress(0, 0, "Waiting for Explorer…");
-                    then = Some((drag, job, Instant::now()));
+                    then = Some((drag, effect, job, Instant::now()));
                     // SAFETY: a timer on our own window, to check for Cancel and patience.
                     unsafe { SetTimer(Some(listener.0), 1, 200, None) };
                 }
@@ -237,7 +287,7 @@ fn watch(
                 _ => break,
             },
             WM_TIMER => {
-                let waited = then.as_ref().map_or(Duration::ZERO, |t| t.2.elapsed());
+                let waited = then.as_ref().map_or(Duration::ZERO, |t| t.3.elapsed());
                 if cancel.load(Ordering::Relaxed) || waited > PATIENCE {
                     break;
                 }
@@ -248,24 +298,34 @@ fn watch(
                 DispatchMessageW(&msg);
             },
         }
-        if then.is_some() && found().is_some() {
+        if then.is_some() && seen.found().is_some() {
             break;
         }
     }
-    let found = found();
+    seen.stop.store(true, Ordering::Relaxed);
     drop(listener);
+    for drive in drives {
+        let _ = drive.join();
+    }
+    SEEN.with_borrow_mut(|s| *s = None);
     if let Some(temp) = temp {
         let _ = fs::remove_dir_all(temp);
     }
-    let Some((drag, job, _)) = then else { return };
-    let Some(dropped) = found.filter(|_| !cancel.load(Ordering::Relaxed)) else {
-        job.done(Err(if cancel.load(Ordering::Relaxed) {
+    let Some((drag, effect, job, _)) = then else {
+        return;
+    };
+    let cancelled = cancel.load(Ordering::Relaxed);
+    let Some(dropped) = seen.found().filter(|_| !cancelled) else {
+        job.done(Err(if cancelled {
             hdec_core::Error::Cancelled
         } else {
-            hdec_core::Error::Io(std::io::Error::other(
+            hdec_core::Error::Io(std::io::Error::other(format!(
                 "Couldn't tell where the items were dropped. Drop them into a folder \
-                 window or onto the desktop.",
-            ))
+                 window or onto the desktop.\n\n(Drop effect {effect}, {} drives \
+                 watched, {} shell notices.)",
+                seen.drives.load(Ordering::Relaxed),
+                seen.notices.load(Ordering::Relaxed),
+            )))
         }));
         return;
     };
@@ -285,6 +345,106 @@ fn watch(
     }
     let dest = dropped.parent().unwrap_or(&dropped).to_path_buf();
     let _ = drag.extract_in(&job, cancel, &dest, Some(dest.clone()), notes);
+}
+
+/// One thread per local, removable or network drive, watching its whole
+/// tree for new folders: the file system's own record, whoever made them.
+fn watch_drives(seen: &Arc<Seen>) -> Vec<std::thread::JoinHandle<()>> {
+    // SAFETY: plain query.
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26u8)
+        .filter(|i| mask & (1 << i) != 0)
+        .filter_map(|i| {
+            let root = format!("{}:\\", char::from(b'A' + i));
+            // SAFETY: a valid root path.
+            let kind = unsafe { GetDriveTypeW(&HSTRING::from(&root)) };
+            // Removable, fixed, network, RAM disk.
+            if ![2, 3, 4, 6].contains(&kind) {
+                return None;
+            }
+            let seen = seen.clone();
+            Some(std::thread::spawn(move || watch_drive(&root, &seen)))
+        })
+        .collect()
+}
+
+fn watch_drive(root: &str, seen: &Seen) {
+    // SAFETY: opening a folder for change notifications, closed below.
+    let Ok(dir) = (unsafe {
+        CreateFileW(
+            &HSTRING::from(root),
+            FILE_LIST_DIRECTORY.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+            None,
+        )
+    }) else {
+        return;
+    };
+    seen.drives.fetch_add(1, Ordering::Relaxed);
+    // DWORD-aligned, as ReadDirectoryChangesW requires.
+    let mut buf = vec![0u32; 16 << 10];
+    while !seen.stop.load(Ordering::Relaxed) {
+        let mut overlapped = OVERLAPPED::default();
+        // SAFETY: the buffer and `overlapped` outlive the request: it is
+        // waited for (or cancelled and waited for) below.
+        let asked = unsafe {
+            ReadDirectoryChangesW(
+                dir,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * 4) as u32,
+                true,
+                FILE_NOTIFY_CHANGE_DIR_NAME,
+                None,
+                Some(&mut overlapped),
+                None,
+            )
+        };
+        if asked.is_err() {
+            break;
+        }
+        let mut got = 0;
+        let done = loop {
+            // SAFETY: our own pending request.
+            match unsafe { GetOverlappedResultEx(dir, &overlapped, &mut got, 200, false) } {
+                Ok(()) => break true,
+                Err(e) if e.code() == HRESULT::from_win32(WAIT_TIMEOUT.0) => {
+                    if seen.stop.load(Ordering::Relaxed) {
+                        // SAFETY: cancel ours, then wait until the kernel lets go of the buffer.
+                        unsafe {
+                            let _ = CancelIoEx(dir, Some(&overlapped));
+                            let _ = GetOverlappedResult(dir, &overlapped, &mut got, true);
+                        }
+                        break false;
+                    }
+                }
+                // Overflowed (too many changes at once) or the like: ask again.
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    got = 0;
+                    break true;
+                }
+            }
+        };
+        if !done {
+            break;
+        }
+        // SAFETY: the kernel wrote `got` bytes of records into `buf`.
+        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), got as usize) };
+        for (action, name) in crate::drag_out::notify_records(bytes) {
+            let new = action == FILE_ACTION_ADDED.0 || action == FILE_ACTION_RENAMED_NEW_NAME.0;
+            let ours = name.rsplit('\\').next() == seen.name.to_str();
+            if new && ours {
+                seen.check(&Path::new(root).join(name));
+            }
+        }
+    }
+    // SAFETY: opened above, no request pending.
+    unsafe {
+        let _ = CloseHandle(dir);
+    }
 }
 
 /// The hidden window, registered for new folders anywhere in the shell.
@@ -379,43 +539,28 @@ extern "system" fn window_proc(window: HWND, msg: u32, wparam: WPARAM, lparam: L
         if lock.is_invalid() {
             return LRESULT(0);
         }
+        SEEN.with_borrow(|seen| {
+            if let Some(seen) = seen {
+                seen.notices.fetch_add(1, Ordering::Relaxed);
+            }
+        });
         if !pidls.is_null() {
             for i in 0..2 {
                 let pidl = *pidls.add(i);
                 if !pidl.is_null()
                     && let Some(path) = path_of(pidl)
-                    && marker_found(&path)
                 {
-                    let _ = PostMessageW(Some(window), WM_FOUND, WPARAM(0), LPARAM(0));
+                    SEEN.with_borrow(|seen| {
+                        if let Some(seen) = seen {
+                            seen.check(&path);
+                        }
+                    });
                 }
             }
         }
         let _ = SHChangeNotification_Unlock(lock);
     }
     LRESULT(0)
-}
-
-/// Whether `path` is the dropped marker, or a folder now holding it (for a
-/// folder-changed notice instead of a new-folder one).
-fn marker_found(path: &Path) -> bool {
-    WATCHING.with_borrow_mut(|w| {
-        let Some(w) = w.as_mut().filter(|w| w.found.is_none()) else {
-            return false;
-        };
-        let candidate = if path.file_name() == Some(w.name.as_os_str()) {
-            path.to_path_buf()
-        } else {
-            path.join(&w.name)
-        };
-        if !candidate.is_dir() {
-            return false;
-        }
-        let ours = fs::canonicalize(&candidate).is_ok_and(|c| c == w.marker);
-        if !ours {
-            w.found = Some(candidate);
-        }
-        !ours
-    })
 }
 
 /// A file-system ID list's path; `None` for virtual items.
