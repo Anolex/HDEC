@@ -1,9 +1,8 @@
-use hdec_core::{CreateOptions, Ctx, Error, ExtractOptions, Format, Level, OnFile, Overwrite};
+use hdec_core::{CreateOptions, Ctx, Error, ExtractOptions, Format, Level, Overwrite};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 fn noop(_: u64, _: u64, _: &str) {}
@@ -592,7 +591,6 @@ fn flatten_drops_the_folders_above_the_selection() {
             only: Some(vec!["tree/sub/deeper".into(), "tree/a.txt".into()]),
             overwrite: Overwrite::Rename,
             flatten: true,
-            ..Default::default()
         };
         let cancel = AtomicBool::new(false);
         let warnings = hdec_core::extract(&archive, &out, &opts, &ctx(None, &cancel)).unwrap();
@@ -609,37 +607,6 @@ fn flatten_drops_the_folders_above_the_selection() {
             "{format:?}"
         );
         assert!(!out.join("tree").exists(), "{format:?}");
-    }
-}
-
-#[test]
-fn on_file_reports_each_file_once_complete() {
-    for format in [Format::Zip, Format::SevenZ, Format::Rar, Format::TarGz] {
-        let (tmp, src, archive) = create(format, Level::Fast, false, None);
-        let out = tmp.path().join("x");
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let (into, root, sources) = (seen.clone(), out.clone(), src.parent().unwrap().to_owned());
-        let opts = ExtractOptions {
-            on_file: Some(OnFile(Arc::new(move |path: &Path| {
-                let rel = path.strip_prefix(&root).unwrap().to_owned();
-                // Complete when reported, the 3 MB one included.
-                let same = fs::read(path).unwrap() == fs::read(sources.join(&rel)).unwrap();
-                into.lock().unwrap().push((rel, same));
-            }))),
-            ..Default::default()
-        };
-        let cancel = AtomicBool::new(false);
-        hdec_core::extract(&archive, &out, &opts, &ctx(None, &cancel)).unwrap();
-        let mut seen = seen.lock().unwrap().clone();
-        seen.sort();
-        let expected = [
-            "tree/a.txt",
-            "tree/sub/deeper/big.bin",
-            "tree/sub/ünïcødé ñame.txt",
-            "tree/zero.bin",
-        ];
-        let expected: Vec<_> = expected.iter().map(|p| (PathBuf::from(p), true)).collect();
-        assert_eq!(seen, expected, "{format:?}");
     }
 }
 

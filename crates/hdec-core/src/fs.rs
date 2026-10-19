@@ -2,7 +2,7 @@
 //! extraction writer (cached folder checks, a pool of writer threads), and
 //! walking source trees.
 
-use crate::{Ctx, Error, ExtractOptions, OnFile, Overwrite, Result, safe_path};
+use crate::{Ctx, Error, ExtractOptions, Overwrite, Result, safe_path};
 use std::collections::HashSet;
 use std::fs::{self, File, Metadata};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -147,13 +147,7 @@ impl Out {
             out.file().set_modified(t)?;
         }
         set_mode(out.file(), mode)?;
-        let Some(on_file) = &self.target.on_file else {
-            return out.commit();
-        };
-        let path = out.path.clone();
-        out.commit()?;
-        (on_file.0)(&path);
-        Ok(())
+        out.commit()
     }
 }
 
@@ -181,7 +175,6 @@ pub(crate) struct Target {
     pub path: PathBuf,
     replace: bool,
     overwrite: Overwrite,
-    on_file: Option<OnFile>,
 }
 
 impl Target {
@@ -220,7 +213,6 @@ pub(crate) struct Extractor {
     overwrite: Overwrite,
     /// `ExtractOptions::flatten`: the selected items whose folders are dropped.
     flatten: Option<Vec<String>>,
-    on_file: Option<OnFile>,
     /// Folders known to be real directories (created or checked).
     dirs: HashSet<PathBuf>,
     /// Folders this run created: nothing in them predates us.
@@ -240,7 +232,6 @@ impl Extractor {
             dest: dest.to_path_buf(),
             overwrite: opts.overwrite,
             flatten: opts.only.clone().filter(|_| opts.flatten),
-            on_file: opts.on_file.clone(),
             dirs: HashSet::from([dest.to_path_buf()]),
             created: HashSet::new(),
             claimed: HashSet::new(),
@@ -327,7 +318,6 @@ impl Extractor {
             path,
             replace,
             overwrite: self.overwrite,
-            on_file: self.on_file.clone(),
         };
         self.claimed.insert(target.path.clone());
         Ok(Some(target))

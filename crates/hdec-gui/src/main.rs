@@ -148,8 +148,6 @@ enum Dialog {
     None,
     Info(String),
     Error(String),
-    /// Explorer is still copying dragged-out files; closing again quits.
-    StillCopying,
     ConfirmDelete(Vec<String>),
     Rename {
         from: String,
@@ -313,8 +311,6 @@ struct App {
     after_save: Option<Then>,
     /// The user chose to quit; let the close request through.
     closing: bool,
-    /// Told that quitting stops a drop target's copy; the next close quits.
-    warned_copying: bool,
 }
 
 struct OpenedFile {
@@ -968,18 +964,10 @@ impl App {
         } else {
             PathBuf::new()
         };
-        // Only Windows describes each file to the drop target.
-        let entries = if cfg!(windows) {
-            let entries = self.entries.iter().filter(|e| inside(&e.path));
-            entries.cloned().collect()
-        } else {
-            Vec::new()
-        };
         let drag = drag_out::DragOut {
             archive: self.reading().unwrap(),
             items,
             password: self.password.clone(),
-            entries,
             jobs: self.drag_jobs.tx.clone(),
             egui: ctx.clone(),
         };
@@ -1798,18 +1786,7 @@ impl App {
             Dialog::Error(text) if message(ctx, icon::WARNING, "Something went wrong", &text) => {
                 Dialog::None
             }
-            Dialog::StillCopying
-                if message(
-                    ctx,
-                    icon::WARNING,
-                    "Still copying",
-                    "The files you dragged out are still being copied. Quitting now \
-                     stops that copy. Close the window again to quit anyway.",
-                ) =>
-            {
-                Dialog::None
-            }
-            open @ (Dialog::Info(_) | Dialog::Error(_) | Dialog::StillCopying) => open,
+            open @ (Dialog::Info(_) | Dialog::Error(_)) => open,
             Dialog::ConfirmDelete(names) => {
                 let subtitle = format!(
                     "{} item(s) will be removed from {archive_name}. This can't be undone.",
@@ -2216,18 +2193,9 @@ impl eframe::App for App {
         {
             self.open(&ctx, path);
         }
-        if !drag_out::copying() {
-            self.warned_copying = false;
-        }
-        if ctx.input(|i| i.viewport().close_requested()) && !self.closing {
-            if self.dirty() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.dialog = Dialog::Unsaved(Then::Close);
-            } else if drag_out::copying() && !self.warned_copying {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.warned_copying = true;
-                self.dialog = Dialog::StillCopying;
-            }
+        if ctx.input(|i| i.viewport().close_requested()) && self.dirty() && !self.closing {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.dialog = Dialog::Unsaved(Then::Close);
         }
         self.shortcuts(&ctx);
         if !self.opened.is_empty() {
@@ -3085,7 +3053,7 @@ mod tests {
             app.navigate("tree/sub".into());
             app.selected.insert("tree/sub/b.txt".into());
         };
-        let states: [(&str, Setup); 13] = [
+        let states: [(&str, Setup); 12] = [
             ("saveback", |app, ctx, path, entries| {
                 app.finish(ctx, Outcome::Opened(path.to_path_buf(), entries.to_vec()));
                 app.dialog = Dialog::SaveBack {
@@ -3130,10 +3098,6 @@ mod tests {
                     wrong: true,
                     show: false,
                 };
-            }),
-            ("still_copying", |app, ctx, path, entries| {
-                app.finish(ctx, Outcome::Opened(path.to_path_buf(), entries.to_vec()));
-                app.dialog = Dialog::StillCopying;
             }),
             ("progress", |app, ctx, path, entries| {
                 app.finish(ctx, Outcome::Opened(path.to_path_buf(), entries.to_vec()));
