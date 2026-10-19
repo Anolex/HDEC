@@ -55,7 +55,7 @@ use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     BHID_DataObject, CFSTR_FILECONTENTS, CFSTR_FILEDESCRIPTORW, CFSTR_PREFERREDDROPEFFECT,
-    FD_ATTRIBUTES, FD_FILESIZE, FD_PROGRESSUI, FD_UNICODE, FD_WRITESTIME, FILEDESCRIPTORW,
+    FD_ATTRIBUTES, FD_FILESIZE, FD_UNICODE, FD_WRITESTIME, FILEDESCRIPTORW,
     IDataObjectAsyncCapability, IDataObjectAsyncCapability_Impl, ILFree,
     SHCreateShellItemArrayFromIDLists, SHCreateStdEnumFmtEtc, SHDoDragDrop, SHParseDisplayName,
 };
@@ -983,8 +983,9 @@ impl IDataObjectAsyncCapability_Impl for DataObject_Impl {
 fn descriptor(files: &[VirtualFile]) -> Vec<u8> {
     let mut out = (files.len() as u32).to_le_bytes().to_vec();
     for file in files {
+        // No FD_PROGRESSUI: our window shows the progress, Explorer needn't.
         let mut d = FILEDESCRIPTORW {
-            dwFlags: (FD_ATTRIBUTES.0 | FD_PROGRESSUI.0 | FD_UNICODE.0) as u32,
+            dwFlags: (FD_ATTRIBUTES.0 | FD_UNICODE.0) as u32,
             dwFileAttributes: if file.is_dir {
                 FILE_ATTRIBUTE_DIRECTORY
             } else {
