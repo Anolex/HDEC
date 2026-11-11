@@ -137,6 +137,9 @@ struct Job {
     /// What it's working on, shown under the verb: an archive's file name.
     subject: String,
     started: Instant,
+    /// When the work itself began (the first progress with a total): what
+    /// speed and time left are measured from, not any waiting before it.
+    clock: Option<Instant>,
     /// What to retry with a password if this job reports one is needed.
     retry: Option<Action>,
     password: Password,
@@ -293,7 +296,7 @@ struct App {
     status: String,
     /// Where entries opened with the default app are extracted; removed on exit.
     preview_dir: Option<tempfile::TempDir>,
-    /// Where dragged-out entries are extracted (Windows); removed on exit.
+    /// Where the marker folder of a drag-out is made (Windows); removed on exit.
     drag_dir: Option<tempfile::TempDir>,
     /// Numbers the subfolders of the two above.
     previews: u32,
@@ -433,6 +436,7 @@ impl App {
             icon,
             subject: self.archive.as_deref().map(file_name).unwrap_or_default(),
             started: Instant::now(),
+            clock: None,
             retry,
             password,
         });
@@ -443,7 +447,12 @@ impl App {
         let mut done = None;
         for msg in job.rx.try_iter() {
             match msg {
-                Msg::Progress(d, t, n) => job.progress = (d, t, n),
+                Msg::Progress(d, t, n) => {
+                    if t > 0 && job.clock.is_none() {
+                        job.clock = Some(Instant::now());
+                    }
+                    job.progress = (d, t, n);
+                }
                 Msg::Done(r) => done = Some(r),
             }
         }
@@ -1711,7 +1720,7 @@ impl App {
         let (done, total, name) = &job.progress;
         let (done, total) = (*done, *total);
         let fraction = (total > 0).then(|| (done as f32 / total as f32).min(1.0));
-        let secs = elapsed.as_secs_f64();
+        let secs = job.clock.map_or(0.0, |c| c.elapsed().as_secs_f64());
         // Average since the start: steadier than the last few reports.
         let rate = (secs >= 1.0 && done > 0).then(|| done as f64 / secs);
         let cancelling = job.cancel.load(Ordering::Relaxed);
@@ -2158,14 +2167,13 @@ impl eframe::App for App {
             self.job = Some(job);
         }
         self.poll_job(&ctx);
-        // Our own dragged-out files dropped back onto the window: nothing to do.
-        let drag_dir = self.drag_dir.as_ref().map(|d| d.path().to_path_buf());
+        // A marker folder dragged out of an HDEC window: nothing to add.
         let dropped: Vec<PathBuf> = ui.input(|i| {
             i.raw
                 .dropped_files
                 .iter()
                 .map(|f| f.path().to_path_buf())
-                .filter(|p| drag_dir.as_ref().is_none_or(|d| !p.starts_with(d)))
+                .filter(|p| !drag_out::is_marker(p))
                 .collect()
         });
         if !dropped.is_empty() && self.job.is_none() {
@@ -3112,6 +3120,7 @@ mod tests {
                     icon: icon::EXPORT,
                     subject: file_name(path),
                     started: Instant::now() - Duration::from_secs(14),
+                    clock: Some(Instant::now() - Duration::from_secs(14)),
                     retry: None,
                     password: None,
                 });

@@ -58,14 +58,17 @@ impl DragOut {
         };
         let result = hdec_core::extract(&self.archive, dest, &opts, &ctx);
         let answer = result.as_ref().map(drop).map_err(ToString::to_string);
-        job.done(result.map(|mut warnings| {
-            warnings.extend(notes);
-            Outcome::DraggedOut {
-                dest: shown_dest,
-                count: self.items.len(),
-                warnings,
+        job.done(match result {
+            Ok(mut warnings) => {
+                warnings.extend(notes);
+                Ok(Outcome::DraggedOut {
+                    dest: shown_dest,
+                    count: self.items.len(),
+                    warnings,
+                })
             }
-        }));
+            Err(e) => Err(with_notes(e, &notes)),
+        });
         answer
     }
 
@@ -80,6 +83,7 @@ impl DragOut {
             icon: icon::EXPORT,
             subject: crate::file_name(&self.archive),
             started: Instant::now(),
+            clock: None,
             retry: None,
             password: None,
         });
@@ -136,6 +140,27 @@ pub fn parents(path: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// `error` with `notes` (what else the user should know) added to its text.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn with_notes(error: hdec_core::Error, notes: &[String]) -> hdec_core::Error {
+    if notes.is_empty() {
+        return error;
+    }
+    let text = format!("{error}\n\n{}", notes.join("\n"));
+    hdec_core::Error::Io(std::io::Error::other(text))
+}
+
+/// What the Windows marker folder's name starts with; 16 hex digits follow.
+pub const MARKER: &str = "HDEC drop ";
+
+/// Whether `path` is a marker folder, ours or another HDEC window's.
+pub fn is_marker(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(MARKER))
+        .is_some_and(|rest| rest.len() == 16 && rest.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Windows drags a marker folder made in a temporary folder.
 pub const NEEDS_DIR: bool = cfg!(windows);
 
@@ -183,6 +208,24 @@ mod tests {
         out.extend((units.len() as u32).to_le_bytes());
         out.extend(units);
         out
+    }
+
+    #[test]
+    fn markers_are_told_from_other_folders() {
+        assert!(is_marker(Path::new("C:/Temp/HDEC drop 0123456789abcdef")));
+        assert!(!is_marker(Path::new("C:/Temp/HDEC drop 0123")));
+        assert!(!is_marker(Path::new(
+            "C:/Temp/HDEC drop 0123456789abcdef/x"
+        )));
+        assert!(!is_marker(Path::new("C:/Temp/HDEC drop notes and more")));
+    }
+
+    #[test]
+    fn notes_are_added_to_an_error() {
+        let plain = with_notes(hdec_core::Error::Cancelled, &[]);
+        assert!(matches!(plain, hdec_core::Error::Cancelled));
+        let noted = with_notes(hdec_core::Error::Cancelled, &["left x".into()]);
+        assert!(noted.to_string().ends_with("\n\nleft x"));
     }
 
     #[test]

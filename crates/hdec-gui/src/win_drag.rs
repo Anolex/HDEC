@@ -29,7 +29,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW, GetLogicalDrives, OPEN_EXISTING,
     ReadDirectoryChangesW,
 };
-use windows::Win32::System::Com::{IBindCtx, IDataObject};
+use windows::Win32::System::Com::{CoTaskMemFree, IBindCtx, IDataObject};
 use windows::Win32::System::IO::{
     CancelIoEx, GetOverlappedResult, GetOverlappedResultEx, OVERLAPPED,
 };
@@ -40,18 +40,19 @@ use windows::Win32::System::Ole::{
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    BHID_DataObject, CSIDL_DESKTOP, GPFIDL_DEFAULT, ILFree, SHCNE_MKDIR, SHCNE_RENAMEFOLDER,
-    SHCNE_UPDATEDIR, SHCNRF_NewDelivery, SHCNRF_ShellLevel, SHChangeNotification_Lock,
-    SHChangeNotification_Unlock, SHChangeNotifyDeregister, SHChangeNotifyEntry,
-    SHChangeNotifyRegister, SHCreateShellItemArrayFromIDLists, SHDoDragDrop, SHGetPathFromIDListEx,
+    BHID_DataObject, CSIDL_DESKTOP, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads,
+    GPFIDL_DEFAULT, ILFree, KF_FLAG_DEFAULT, SHCNE_MKDIR, SHCNE_RENAMEFOLDER, SHCNE_UPDATEDIR,
+    SHCNRF_NewDelivery, SHCNRF_ShellLevel, SHChangeNotification_Lock, SHChangeNotification_Unlock,
+    SHChangeNotifyDeregister, SHChangeNotifyEntry, SHChangeNotifyRegister,
+    SHCreateShellItemArrayFromIDLists, SHDoDragDrop, SHGetKnownFolderPath, SHGetPathFromIDListEx,
     SHGetSpecialFolderLocation, SHParseDisplayName,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GA_ROOT, GetAncestor,
-    GetCursorPos, GetMessageW, MSG, PostMessageW, RegisterClassW, SetTimer, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_TIMER, WNDCLASSW, WindowFromPoint,
+    GetClassNameW, GetCursorPos, GetMessageW, MSG, PostMessageW, RegisterClassW, SetTimer,
+    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_TIMER, WNDCLASSW, WindowFromPoint,
 };
-use windows_core::{BOOL, ComObject, HRESULT, HSTRING, implement, w};
+use windows_core::{BOOL, ComObject, GUID, HRESULT, HSTRING, implement, w};
 
 /// A shell change notification for the watch window.
 const WM_SHELL_CHANGE: u32 = WM_APP + 1;
@@ -77,7 +78,8 @@ pub fn start(frame: &eframe::Frame, drag: DragOut, dir: &Path) -> Result<(), Str
         let _ = OleInitialize(None);
     }
     let name = OsString::from(format!(
-        "HDEC drop {:016x}",
+        "{}{:016x}",
+        crate::drag_out::MARKER,
         std::collections::hash_map::RandomState::new().hash_one(std::process::id())
     ));
     let marker = dir.join(&name);
@@ -128,14 +130,27 @@ struct Source {
 }
 
 impl Source {
-    fn over_own_window(&self) -> bool {
+    /// Over our own window or another HDEC's (the same window class), which
+    /// would take the marker for a folder to add.
+    fn over_hdec_window(&self) -> bool {
         let mut at = POINT::default();
         // SAFETY: plain Win32 calls on a valid out-pointer.
-        unsafe {
-            GetCursorPos(&mut at).is_ok()
-                && GetAncestor(WindowFromPoint(at), GA_ROOT) == self.window
-        }
+        let under = unsafe {
+            if GetCursorPos(&mut at).is_err() {
+                return false;
+            }
+            GetAncestor(WindowFromPoint(at), GA_ROOT)
+        };
+        under == self.window
+            || class_of(under).is_some_and(|class| Some(class) == class_of(self.window))
     }
+}
+
+fn class_of(window: HWND) -> Option<Vec<u16>> {
+    let mut buf = [0u16; 256];
+    // SAFETY: the buffer's size is passed; 0 = no such window.
+    let len = unsafe { GetClassNameW(window, &mut buf) };
+    (len > 0).then(|| buf[..len as usize].to_vec())
 }
 
 impl IDropSource_Impl for Source_Impl {
@@ -146,8 +161,8 @@ impl IDropSource_Impl for Source_Impl {
         if keys.0 & MK_LBUTTON.0 != 0 {
             return S_OK;
         }
-        // Released: over nothing that takes it, or back over our own window.
-        if self.effect.load(Ordering::Relaxed) == DROPEFFECT_NONE.0 || self.over_own_window() {
+        // Released: over nothing that takes it, or over an HDEC window.
+        if self.effect.load(Ordering::Relaxed) == DROPEFFECT_NONE.0 || self.over_hdec_window() {
             return DRAGDROP_S_CANCEL;
         }
         self.dropped.store(true, Ordering::Relaxed);
@@ -267,7 +282,7 @@ fn watch(
     };
     let window = listener.0.0 as isize;
     seen.window.store(window, Ordering::Relaxed);
-    let drives = watch_drives(&seen);
+    watch_drives(&seen);
     let _ = ready.send(Ok(window));
     let cancel = Arc::new(AtomicBool::new(false));
     let mut then = None;
@@ -304,9 +319,8 @@ fn watch(
     }
     seen.stop.store(true, Ordering::Relaxed);
     drop(listener);
-    for drive in drives {
-        let _ = drive.join();
-    }
+    // The drive threads end by themselves; not waited for: one may be stuck
+    // opening a network drive that can't be reached.
     SEEN.with_borrow_mut(|s| *s = None);
     if let Some(temp) = temp {
         let _ = fs::remove_dir_all(temp);
@@ -314,58 +328,85 @@ fn watch(
     let Some((drag, effect, job, _)) = then else {
         return;
     };
-    let cancelled = cancel.load(Ordering::Relaxed);
-    let Some(dropped) = seen.found().filter(|_| !cancelled) else {
-        job.done(Err(if cancelled {
-            hdec_core::Error::Cancelled
-        } else {
-            hdec_core::Error::Io(std::io::Error::other(format!(
-                "Couldn't tell where the items were dropped. Drop them into a folder \
-                 window or onto the desktop.\n\n(Drop effect {effect}, {} drives \
-                 watched, {} shell notices.)",
-                seen.drives.load(Ordering::Relaxed),
-                seen.notices.load(Ordering::Relaxed),
-            )))
-        }));
-        return;
-    };
+    let found = seen.found();
+    // The marker goes whatever happens next (found and then cancelled, too).
     // Still the empty folder we made: `remove_dir` refuses anything else.
     // Explorer may hold it open for a moment after making it.
     let mut notes = Vec::new();
-    for attempt in 0.. {
-        match fs::remove_dir(&dropped) {
-            Ok(()) => break,
-            Err(_) if !dropped.exists() => break,
-            Err(_) if attempt < 40 => std::thread::sleep(Duration::from_millis(50)),
-            Err(e) => {
-                notes.push(format!("Couldn't remove {}: {e}", dropped.display()));
-                break;
+    let mut denied = false;
+    if let Some(dropped) = &found {
+        for attempt in 0.. {
+            match fs::remove_dir(dropped) {
+                Ok(()) => break,
+                Err(_) if !dropped.exists() => break,
+                Err(_) if attempt < 40 => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => {
+                    denied = e.kind() == std::io::ErrorKind::PermissionDenied;
+                    notes.push(format!("Couldn't remove {}: {e}", dropped.display()));
+                    break;
+                }
             }
         }
     }
-    let dest = dropped.parent().unwrap_or(&dropped).to_path_buf();
-    let _ = drag.extract_in(&job, cancel, &dest, Some(dest.clone()), notes);
+    let dest = found.map(|dropped| dropped.parent().unwrap_or(&dropped).to_path_buf());
+    let error = if cancel.load(Ordering::Relaxed) {
+        hdec_core::Error::Cancelled
+    } else if let Some(dest) = &dest
+        && denied
+    {
+        // Explorer asked for permission and made the marker with it; we have none.
+        hdec_core::Error::Io(std::io::Error::other(format!(
+            "HDEC isn't allowed to write to {}. Drop the items somewhere else and \
+             move them there with Explorer.",
+            dest.display()
+        )))
+    } else if let Some(dest) = dest {
+        let _ = drag.extract_in(&job, cancel, &dest, Some(dest.clone()), notes);
+        return;
+    } else {
+        hdec_core::Error::Io(std::io::Error::other(format!(
+            "Couldn't tell where the items were dropped. Drop them into a folder \
+             window or onto the desktop.\n\n(Drop effect {effect}, {} drives \
+             watched, {} shell notices.)",
+            seen.drives.load(Ordering::Relaxed),
+            seen.notices.load(Ordering::Relaxed),
+        )))
+    };
+    job.done(Err(crate::drag_out::with_notes(error, &notes)));
 }
 
 /// One thread per local, removable or network drive, watching its whole
 /// tree for new folders: the file system's own record, whoever made them.
-fn watch_drives(seen: &Arc<Seen>) -> Vec<std::thread::JoinHandle<()>> {
+/// Also the desktop, Documents and Downloads where they are redirected to a
+/// share (no drive letter). The threads end once `Seen::stop` is set.
+fn watch_drives(seen: &Arc<Seen>) {
     // SAFETY: plain query.
     let mask = unsafe { GetLogicalDrives() };
-    (0..26u8)
-        .filter(|i| mask & (1 << i) != 0)
-        .filter_map(|i| {
-            let root = format!("{}:\\", char::from(b'A' + i));
-            // SAFETY: a valid root path.
-            let kind = unsafe { GetDriveTypeW(&HSTRING::from(&root)) };
-            // Removable, fixed, network, RAM disk.
-            if ![2, 3, 4, 6].contains(&kind) {
-                return None;
-            }
-            let seen = seen.clone();
-            Some(std::thread::spawn(move || watch_drive(&root, &seen)))
-        })
-        .collect()
+    let drives = (0..26u8).filter(|i| mask & (1 << i) != 0).filter_map(|i| {
+        let root = format!("{}:\\", char::from(b'A' + i));
+        // SAFETY: a valid root path.
+        let kind = unsafe { GetDriveTypeW(&HSTRING::from(&root)) };
+        // Removable, fixed, network, RAM disk.
+        [2, 3, 4, 6].contains(&kind).then_some(root)
+    });
+    let shares = [FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads]
+        .iter()
+        .filter_map(known_folder)
+        .filter(|path| path.starts_with(r"\\"));
+    for root in drives.chain(shares) {
+        let seen = seen.clone();
+        std::thread::spawn(move || watch_drive(&root, &seen));
+    }
+}
+
+fn known_folder(id: &GUID) -> Option<String> {
+    // SAFETY: the returned string is ours to free, and is, once copied.
+    unsafe {
+        let path = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()?;
+        let text = path.to_string().ok();
+        CoTaskMemFree(Some(path.0.cast_const().cast()));
+        text
+    }
 }
 
 fn watch_drive(root: &str, seen: &Seen) {
