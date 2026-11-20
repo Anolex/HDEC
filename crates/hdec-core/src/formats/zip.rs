@@ -860,7 +860,7 @@ impl Seek for Source {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))] // its one test needs a sparse file
 mod tests {
     use super::*;
 
@@ -872,7 +872,7 @@ mod tests {
 
     /// An entry that has a ZIP64 field (as `BigEntry` writes them), raw-copied
     /// past 4 GiB: zip 9 doubles the field.
-    #[cfg(unix)] // a sparse file; NTFS would write out the 4 GiB of zeros
+    // A sparse file; NTFS would write out the 4 GiB of zeros.
     #[test]
     fn raw_copy_past_4_gib() -> Result<()> {
         let mut one = ZipWriter::new(io::Cursor::new(Vec::new()));
