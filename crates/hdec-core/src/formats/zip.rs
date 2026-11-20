@@ -303,7 +303,7 @@ fn add_items(
     );
     let deflate_level = match opts.level {
         Level::Store => None,
-        Level::Fast => Some(1),
+        Level::Fast => Some(super::stream::DEFLATE_FAST),
         Level::Normal => Some(6),
         Level::Max => Some(9),
     };

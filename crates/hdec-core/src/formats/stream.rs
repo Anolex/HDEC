@@ -299,6 +299,11 @@ pub(crate) enum Encoder<W: Write> {
     XzMt(XzWriterMt<W>),
 }
 
+/// Deflate level for `Level::Fast`. Not 1: zlib-rs level 1 ("quick") writes
+/// fixed Huffman codes only, so incompressible data (game assets, media)
+/// grows ~6%; level 2 falls back to stored blocks, ~30% slower.
+pub(crate) const DEFLATE_FAST: u32 = 2;
+
 impl<W: Write> Encoder<W> {
     pub fn new(format: Format, w: W, level: Level) -> Result<Self> {
         let n = match level {
@@ -313,6 +318,11 @@ impl<W: Write> Encoder<W> {
                 let mut w = w;
                 // gzip header: deflate, no name, no mtime, OS unknown (as flate2 writes it).
                 w.write_all(&[0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 255])?;
+                let n = if level == Level::Fast {
+                    DEFLATE_FAST
+                } else {
+                    n
+                };
                 Encoder::Gz(ParEncoder::deflate(w, n))
             }
             Format::Bz2 | Format::TarBz2 => Encoder::Bz2(ParEncoder::bzip2(w, n.max(1))),

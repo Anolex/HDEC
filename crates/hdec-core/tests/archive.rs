@@ -1324,6 +1324,48 @@ fn duplicate_names_follow_the_overwrite_policy() {
     }
 }
 
+/// Already-compressed data (game assets, media) must not grow on Fast: zlib-rs
+/// level 1 made it ~6% bigger.
+#[test]
+fn fast_deflate_does_not_inflate_incompressible_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("noise");
+    fs::create_dir(&src).unwrap();
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let noise: Vec<u8> = (0..3_000_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 32) as u8
+        })
+        .collect();
+    // One whole-entry file, one chunked (over 1 MiB).
+    fs::write(src.join("small.bin"), &noise[..500_000]).unwrap();
+    fs::write(src.join("big.bin"), &noise).unwrap();
+    let cancel = AtomicBool::new(false);
+    for format in [Format::Zip, Format::TarGz] {
+        let archive = tmp.path().join(format!("out.{}", format.extension()));
+        let opts = CreateOptions {
+            format,
+            level: Level::Fast,
+            ..Default::default()
+        };
+        hdec_core::create(
+            std::slice::from_ref(&src),
+            &archive,
+            &opts,
+            &ctx(None, &cancel),
+        )
+        .unwrap();
+        let len = fs::metadata(&archive).unwrap().len();
+        assert!(
+            len < 3_550_000,
+            "{format:?}: {len} bytes from 3.5 MB of noise"
+        );
+    }
+}
+
 #[test]
 fn zip_big_files_deflate_in_parallel() {
     let tmp = tempfile::tempdir().unwrap();
