@@ -14,7 +14,7 @@ use zip::unstable::write::FileOptionsExt;
 use zip::write::{FileOptions, SimpleFileOptions};
 use zip::{AesMode, CompressionMethod, ZipArchive, ZipWriter};
 
-type Archive = ZipArchive<BufReader<Volume>>;
+type Archive = ZipArchive<BufReader<Source>>;
 
 impl From<ZipError> for Error {
     fn from(e: ZipError) -> Self {
@@ -32,7 +32,7 @@ impl From<ZipError> for Error {
 }
 
 fn open(path: &Path) -> Result<Archive> {
-    Ok(ZipArchive::new(BufReader::new(Volume::open(path)?))?)
+    Ok(ZipArchive::new(BufReader::new(Source::open(path)?))?)
 }
 
 pub fn list(path: &Path, _ctx: &Ctx) -> Result<Vec<Entry>> {
@@ -256,6 +256,7 @@ pub fn create(sources: &[PathBuf], dest: &Path, opts: &CreateOptions, ctx: &Ctx)
 
 fn finish(w: Writer) -> Result<()> {
     let out = w.finish()?.into_inner().map_err(|e| e.into_error())?;
+    drop_stale_zip64(out.file())?;
     out.file().sync_all()?;
     out.commit()
 }
@@ -634,4 +635,274 @@ fn to_dos(t: SystemTime) -> Option<zip::DateTime> {
 fn from_dos(d: zip::DateTime) -> Option<SystemTime> {
     let local = jiff::civil::DateTime::try_from(d).ok()?;
     Some(local.to_zoned(TimeZone::system()).ok()?.timestamp().into())
+}
+
+// zip 9 (up to 9.8.1 at least) `raw_copy_file` copies the source entry's ZIP64
+// field as an opaque extra field, after the fresh one the writer makes itself.
+// Readers take the last one, so for an entry past 4 GiB the copy's stale sizes
+// are read as its offset: "Invalid local file header". `finish` drops the
+// copies from what we write; `Source` reads archives written before that.
+
+const CENTRAL: [u8; 4] = 0x02014b50u32.to_le_bytes();
+const END: [u8; 4] = 0x06054b50u32.to_le_bytes();
+const END64: [u8; 4] = 0x06064b50u32.to_le_bytes();
+const LOCATOR: [u8; 4] = 0x07064b50u32.to_le_bytes();
+
+fn u16_at(b: &[u8], i: usize) -> usize {
+    u16::from_le_bytes([b[i], b[i + 1]]).into()
+}
+
+fn u64_at(b: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(b[i..i + 8].try_into().expect("8 bytes"))
+}
+
+/// Where a ZIP64 archive's central directory is, and what follows it.
+struct Footer {
+    cd_start: u64,
+    cd_len: u64,
+    /// Everything after the central directory: the ZIP64 end record, the
+    /// locator and the end record (at `end`) with its comment.
+    tail: Vec<u8>,
+    end: usize,
+}
+
+impl Footer {
+    /// `None` without ZIP64 end records (no entry can need a ZIP64 field then)
+    /// or if they don't add up.
+    fn read(r: &mut (impl Read + Seek), len: u64) -> io::Result<Option<Self>> {
+        let back = len.min(0xFFFF + 22 + 20);
+        r.seek(SeekFrom::Start(len - back))?;
+        let mut buf = vec![0; back as usize];
+        r.read_exact(&mut buf)?;
+        // The end record (22 bytes + comment) is the last thing in the file.
+        let Some(end) = (20..buf.len().saturating_sub(21))
+            .rev()
+            .find(|&i| buf[i..i + 4] == END && i + 22 + u16_at(&buf, i + 20) == buf.len())
+        else {
+            return Ok(None);
+        };
+        let locator = &buf[end - 20..end];
+        if locator[..4] != LOCATOR {
+            return Ok(None);
+        }
+        let (end64, end_pos) = (u64_at(locator, 8), len - (buf.len() - end) as u64);
+        // The ZIP64 end record is 56 bytes plus rarely used extensible data.
+        let fits = end_pos
+            .checked_sub(20 + 56)
+            .is_some_and(|last| end64 <= last);
+        if !fits || end_pos - end64 > 1 << 20 {
+            return Ok(None);
+        }
+        r.seek(SeekFrom::Start(end64))?;
+        let mut tail = vec![0; (len - end64) as usize];
+        r.read_exact(&mut tail)?;
+        let (cd_len, cd_start) = (u64_at(&tail, 40), u64_at(&tail, 48));
+        if tail[..4] != END64 || cd_start.checked_add(cd_len) != Some(end64) {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            cd_start,
+            cd_len,
+            end: (end_pos - end64) as usize,
+            tail,
+        }))
+    }
+
+    /// The bytes from `cd_start` on with `cd` as the central directory.
+    fn with_cd(mut self, mut cd: Vec<u8>) -> Vec<u8> {
+        let shrink = self.cd_len - cd.len() as u64;
+        self.tail[40..48].copy_from_slice(&(cd.len() as u64).to_le_bytes());
+        let (locator, end) = self.tail[self.end - 20..].split_at_mut(20);
+        let end64 = u64_at(locator, 8) - shrink;
+        locator[8..16].copy_from_slice(&end64.to_le_bytes());
+        if end[12..16] != [0xFF; 4] {
+            end[12..16].copy_from_slice(&(cd.len() as u32).to_le_bytes());
+        }
+        cd.extend(self.tail);
+        cd
+    }
+}
+
+/// `cd` with every ZIP64 field but the first dropped from each record; `None`
+/// when no record has two (or `cd` doesn't parse).
+fn dedupe_zip64(cd: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(cd.len());
+    let mut changed = false;
+    let mut rest = cd;
+    while !rest.is_empty() {
+        if rest.len() < 46 || rest[..4] != CENTRAL {
+            return None;
+        }
+        let (name, extra, comment) = (u16_at(rest, 28), u16_at(rest, 30), u16_at(rest, 32));
+        let extra_start = 46 + name;
+        let extra_end = extra_start + extra;
+        let record = rest.get(..extra_end + comment)?;
+        let mut fields = Vec::with_capacity(extra);
+        let (mut i, mut seen) = (extra_start, false);
+        while i + 4 <= extra_end {
+            let (id, n) = (u16_at(record, i), u16_at(record, i + 2));
+            let field = record
+                .get(i..i + 4 + n)
+                .filter(|_| i + 4 + n <= extra_end)?;
+            if id == 1 && seen {
+                changed = true;
+            } else {
+                fields.extend_from_slice(field);
+            }
+            seen |= id == 1;
+            i += 4 + n;
+        }
+        fields.extend_from_slice(&record[i..extra_end]);
+        out.extend_from_slice(&record[..30]);
+        out.extend_from_slice(&(fields.len() as u16).to_le_bytes());
+        out.extend_from_slice(&record[32..extra_start]);
+        out.extend_from_slice(&fields);
+        out.extend_from_slice(&record[extra_end..]);
+        rest = &rest[record.len()..];
+    }
+    changed.then_some(out)
+}
+
+/// Rewrites the central directory of the archive just written to `f` if
+/// `raw_copy_file` doubled any ZIP64 field (the file only gets shorter).
+fn drop_stale_zip64(mut f: &File) -> Result<()> {
+    let len = f.seek(SeekFrom::End(0))?;
+    let Some(footer) = Footer::read(&mut f, len)? else {
+        return Ok(());
+    };
+    let mut cd = vec![0; footer.cd_len as usize];
+    f.seek(SeekFrom::Start(footer.cd_start))?;
+    f.read_exact(&mut cd)?;
+    let Some(cd) = dedupe_zip64(&cd) else {
+        return Ok(());
+    };
+    let start = footer.cd_start;
+    let fixed = footer.with_cd(cd);
+    f.seek(SeekFrom::Start(start))?;
+    f.write_all(&fixed)?;
+    f.set_len(start + fixed.len() as u64)?;
+    Ok(())
+}
+
+/// The archive file(s), read with a deduplicated central directory when one
+/// was written with doubled ZIP64 fields (see above).
+struct Source {
+    volume: Volume,
+    /// Where the central directory starts, and the fixed bytes from there on.
+    fixed: Option<(u64, Vec<u8>)>,
+    pos: u64,
+}
+
+impl Source {
+    fn open(path: &Path) -> Result<Self> {
+        let mut volume = Volume::open(path)?;
+        let fixed = Self::fix(&mut volume).ok().flatten();
+        volume.seek(SeekFrom::Start(0))?;
+        Ok(Self {
+            volume,
+            fixed,
+            pos: 0,
+        })
+    }
+
+    fn fix(volume: &mut Volume) -> io::Result<Option<(u64, Vec<u8>)>> {
+        let Some(footer) = Footer::read(volume, volume.len())? else {
+            return Ok(None);
+        };
+        let mut cd = vec![0; footer.cd_len as usize];
+        volume.seek(SeekFrom::Start(footer.cd_start))?;
+        volume.read_exact(&mut cd)?;
+        Ok(dedupe_zip64(&cd).map(|cd| (footer.cd_start, footer.with_cd(cd))))
+    }
+
+    fn len(&self) -> u64 {
+        match &self.fixed {
+            Some((start, bytes)) => start + bytes.len() as u64,
+            None => self.volume.len(),
+        }
+    }
+}
+
+impl Read for Source {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = match &self.fixed {
+            Some((start, bytes)) if self.pos >= *start => {
+                let from = bytes.len().min((self.pos - start) as usize);
+                let n = buf.len().min(bytes.len() - from);
+                buf[..n].copy_from_slice(&bytes[from..from + n]);
+                n
+            }
+            Some((start, _)) => {
+                let want = buf.len().min((start - self.pos) as usize);
+                self.volume.seek(SeekFrom::Start(self.pos))?;
+                self.volume.read(&mut buf[..want])?
+            }
+            None => {
+                self.volume.seek(SeekFrom::Start(self.pos))?;
+                self.volume.read(buf)?
+            }
+        };
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for Source {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(p) => Some(p),
+            SeekFrom::End(d) => self.len().checked_add_signed(d),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+        };
+        self.pos =
+            new.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before start"))?;
+        Ok(self.pos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_first<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Result<String> {
+        let mut s = String::new();
+        zip.by_index(0)?.read_to_string(&mut s)?;
+        Ok(s)
+    }
+
+    /// An entry that has a ZIP64 field (as `BigEntry` writes them), raw-copied
+    /// past 4 GiB: zip 9 doubles the field.
+    #[cfg(unix)] // a sparse file; NTFS would write out the 4 GiB of zeros
+    #[test]
+    fn raw_copy_past_4_gib() -> Result<()> {
+        let mut one = ZipWriter::new(io::Cursor::new(Vec::new()));
+        one.start_file("a", SimpleFileOptions::default().large_file(true))?;
+        one.write_all(b"hello")?;
+        let mut one = ZipArchive::new(one.finish()?)?;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("big.zip");
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        (&file).seek(SeekFrom::Start(1 << 32))?;
+        let mut w = ZipWriter::new(&file);
+        w.raw_copy_file(one.by_index_raw(0)?)?;
+        w.finish()?;
+        let plain = || -> Result<String> { read_first(&mut ZipArchive::new(File::open(&path)?)?) };
+        assert!(
+            plain().is_err(),
+            "zip fixed raw_copy_file: drop the workaround"
+        );
+        assert_eq!(read_first(&mut open(&path)?)?, "hello");
+
+        let len = (&file).seek(SeekFrom::End(0))?;
+        drop_stale_zip64(&file)?;
+        assert!((&file).seek(SeekFrom::End(0))? < len);
+        assert_eq!(plain()?, "hello");
+        assert_eq!(read_first(&mut open(&path)?)?, "hello");
+        Ok(())
+    }
 }

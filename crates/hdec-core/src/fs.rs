@@ -27,7 +27,13 @@ impl OutFile {
         let mut tmp = path.clone().into_os_string();
         tmp.push(".hdec-tmp");
         let tmp = PathBuf::from(tmp);
-        let file = File::create(&tmp)?;
+        // Readable too: the ZIP writer fixes up what it wrote (`zip::finish`).
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
         Ok(Self {
             path,
             tmp,
